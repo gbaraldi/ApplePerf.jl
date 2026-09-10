@@ -69,9 +69,11 @@ ApplePerf.Analysis.report(res; region = "count_pos random", top = 3, by = "BRANC
 
 banner("6. Export for pprof / speedscope")
 pb = joinpath(pwd(), "demo.pb.gz"); folded = joinpath(pwd(), "demo.folded")
-ApplePerf.Analysis.pprof(res, pb)
+ApplePerf.Analysis.pprof(res, pb)                                        # one column per event
 ApplePerf.Analysis.collapsed(res, folded; by = "L1D_CACHE_MISS_LD_NONSPEC")
-println("wrote ", pb, " and ", folded)
+svg_tlb = joinpath(pwd(), "demo_tlb.svg")
+ApplePerf.Analysis.flamegraph(res, svg_tlb; by = "L1D_TLB_MISS_NONSPEC")  # heat map: TLB misses per sample
+println("wrote ", pb, ", ", folded, " and ", svg_tlb)
 println("  julia> using PProf; PProf.refresh(file = \"", pb, "\")     # or: pprof -http=: ", pb)
 println("  pprof -sample_index=BRANCH_MISPRED_NONSPEC -tagfocus='region=count_pos random' -top ", pb)
 println("  speedscope ", folded, "                         # flame graph weighted by L1D misses")
@@ -85,6 +87,7 @@ res2 = profile(; options = RecordingOptions(bottlenecks = true), name = "demo") 
         @region "count_pos sorted"           count_pos(sorted)
     end
 end
+show(stdout, MIME"text/plain"(), res2); println()   # remarks per region
 ApplePerf.Analysis.bottleneck_table(res2; top = 6)
 svg = joinpath(pwd(), "demo_bottlenecks.svg")
 ApplePerf.Analysis.flamegraph(res2, svg)

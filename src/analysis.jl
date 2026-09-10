@@ -530,6 +530,7 @@ function Base.show(io::IO, ::MIME"text/plain", res::ProfileResult)
             length(res.counter_rows), " counter rows", isempty(res.pt_points) ? "" : ", $(length(res.pt_points)) processor-trace points")
     isempty(res.counter_rows) || println(io, "  guided-mode metrics below are Instruments' derived interval values, not raw counts; see the remarks lines")
     regs = regions(res)
+    flagnames = Set(n for (_, _, n) in res.remarks)
     if !isempty(regs)
         println(io)
         @printf(io, "  %-28s %6s %12s %8s %14s\n", "region", "runs", "wall", "samples", res.weight_label == "time" ? "sampled time" : res.weight_label)
@@ -538,7 +539,7 @@ function Base.show(io::IO, ::MIME"text/plain", res::ProfileResult)
                     res.weight_unit == "ns" ? @sprintf("%.3f ms", r.weight / 1e6) : _commas(r.weight))
             if !isempty(r.counters)
                 for (k, v) in sort(collect(r.counters))
-                    k in keys(r.remarks) && continue          # remark flags are reported on the remarks line
+                    k in flagnames && continue                # remark flags are reported on the remarks line
                     @printf(io, "      %-40s %18s\n", k, _commas(round(Int, v)))
                 end
             end

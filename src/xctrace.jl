@@ -83,7 +83,9 @@ Two sampling strategies:
   a sample with a call stack is taken every `threshold` occurrences of the
   event on the profiled thread. Sample weights are then event counts, so
   per-function / per-line attribution is in that event's units. Configurable
-  events only (`FIXED_*` are rejected by Instruments as PMI triggers).
+  events only (`FIXED_*` are rejected by Instruments as PMI triggers), and
+  `events` is ignored in this mode: Instruments refuses to attach counter
+  arrays to event-triggered samples.
 
 `bottlenecks = true` is shorthand for Instruments' guided CPU-bottleneck
 analysis (`events = String[]`, `mode = "bottlenecks"`): no raw counters, but
@@ -164,7 +166,9 @@ end
 
 """JSON text for `xctrace record --recording-options`."""
 function options_json(o::RecordingOptions)
-    evs = o.bottlenecks ? String[] : String[KPEP.event(e).name for e in o.events]
+    # Instruments cannot combine an event-triggered sampler with per-sample counter
+    # arrays ("samplers differ"), so PMI mode records the trigger event only.
+    evs = (o.bottlenecks || o.sample_event !== nothing) ? String[] : String[KPEP.event(e).name for e in o.events]
     if !isempty(evs)
         KPEP.can_coexist(evs...) || throw(ArgumentError("events cannot be counted together on this CPU: $(join(evs, ", ")). Groups that work: $(KPEP.plan_groups(evs))"))
     end

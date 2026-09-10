@@ -211,5 +211,6 @@ bottleneck. About 35 seconds.
 
 * `examples/basic.jl` — timer profile with regions, exports.
 * `examples/l1d_misses.jl` — L1D-miss-triggered sampling and per-line miss attribution.
-* `examples/manual_events.jl` — five events per sample, exact per-region totals, per-event pprof columns.
+* `examples/manual_events.jl` — five events per sample, exact per-region totals, per-event pprof columns and flame graph.
+* `examples/bottlenecks.jl` — Instruments' bottleneck analysis attributed to regions, functions and a colored flame graph.
 * `examples/kpc_root.jl` — exact counters (run with `sudo`).
