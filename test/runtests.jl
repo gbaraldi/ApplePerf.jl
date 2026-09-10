@@ -1,7 +1,13 @@
 using ApplePerf, Test
 
 @testset "ApplePerf" begin
+    hw = ApplePerf.KPEP.available()
+    hw || @info "no kpep database on this machine (virtual machine?); skipping counter tests"
+
     @testset "kpep database" begin
+        if !hw
+            @test_throws ErrorException events()
+        else
         evs = events()
         @test length(evs) > 50
         @test any(e -> e.name == "FIXED_CYCLES" && e.fixed, evs)
@@ -20,6 +26,7 @@ using ApplePerf, Test
         @test !can_coexist(fill("CORE_ACTIVE_CYCLE", 9)...)   # 9 configurable events, 8 slots
         @test_throws ErrorException ApplePerf.KPEP.event("NOT_AN_EVENT")
         @test occursin("L1D", sprint(io -> describe("L1D_CACHE_MISS_LD"; io)))
+        end
     end
 
     @testset "signposts" begin
@@ -30,6 +37,7 @@ using ApplePerf, Test
     end
 
     @testset "recording options" begin
+        if hw
         j = ApplePerf.XCTrace.options_json(RecordingOptions())
         @test occursin("\"sampleByTime\":true", j) && occursin("\"manual\"", j)
         @test occursin("\"guided\"", ApplePerf.XCTrace.options_json(RecordingOptions(events = String[])))
@@ -41,10 +49,13 @@ using ApplePerf, Test
         @test occursin("\"manual\"", j) && occursin("YnBsaXN0", j) == false   # XML archive, base64 of "<?xml"
         @test occursin("PD94bWwg", j)
         @test_throws ArgumentError ApplePerf.XCTrace.options_json(RecordingOptions(events = fill("CORE_ACTIVE_CYCLE", 9)))
+        end
     end
 
     @testset "kpc (root only)" begin
-        if KPC.has_access()
+        if !hw
+            @test !KPC.has_access()
+        elseif KPC.has_access()
             d = KPC.measure(() -> sum(rand(10^6)), ["FIXED_CYCLES", "FIXED_INSTRUCTIONS"])
             @test d["FIXED_CYCLES"] > 10^5 && d["FIXED_INSTRUCTIONS"] > 10^5
         else
@@ -53,7 +64,7 @@ using ApplePerf, Test
     end
 
     @testset "profile via xctrace" begin
-        if xctrace_available() && get(ENV, "APPLEPERF_TEST_XCTRACE", "1") == "1"
+        if hw && xctrace_available() && get(ENV, "APPLEPERF_TEST_XCTRACE", "1") == "1"
             A = rand(1 << 20); f(A) = sum(A); f(A)
             res = profile(; name = "outer") do
                 t = time(); while time() - t < 0.3; @region "sum" f(A); end

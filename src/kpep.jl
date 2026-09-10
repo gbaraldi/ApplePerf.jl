@@ -57,13 +57,21 @@ Base.show(io::IO, e::Event) = print(io, "Event(", e.name, e.fixed ? ", fixed" : 
 
 _cstr(p::Cstring) = p == C_NULL ? "" : unsafe_string(p)
 
+frameworks_present() = Sys.isapple() && Sys.ARCH === :aarch64 && isdir(dirname(KPERFDATA))
+
+"""Whether the private frameworks exist and a kpep database exists for this CPU (false on most VMs)."""
 function available()
-    return Sys.isapple() && Sys.ARCH === :aarch64 && isdir(dirname(KPERFDATA))
+    frameworks_present() || return false
+    return try
+        _db_handle().ptr != C_NULL
+    catch
+        false
+    end
 end
 
 function _load()
     _kpep[] == C_NULL || return
-    available() || error("ApplePerf.KPEP needs macOS on Apple Silicon with the private kperfdata framework")
+    frameworks_present() || error("ApplePerf.KPEP needs macOS on Apple Silicon with the private kperfdata framework")
     _kpep[] = dlopen(KPERFDATA)
     _kperf[] = dlopen(KPERF)
     return
@@ -80,14 +88,21 @@ else
     end
 end
 
-const _db = _once() do
+# kpep_db_create fails (code 7) when macOS has no event database for the CPU it
+# runs on, e.g. inside virtual machines such as CI runners. Remember the outcome
+# instead of letting a OncePerProcess initializer fail permanently.
+const _db_handle = _once() do
     r = Ref{Ptr{Cvoid}}(C_NULL)
     rc = ccall(sym(:kpep_db_create), Cint, (Cstring, Ref{Ptr{Cvoid}}), C_NULL, r)
-    rc == 0 || error("kpep_db_create failed with code $rc")
-    r[]
+    (ptr = rc == 0 ? r[] : C_NULL, rc = Int(rc))
 end
 """Handle to the kpep database for the current CPU (created once per process)."""
-db() = _db()
+function db()
+    h = _db_handle()
+    h.ptr == C_NULL && error("no kpep performance-event database for this CPU (kpep_db_create failed with code $(h.rc)). " *
+                             "Hardware counters are unavailable here; this is expected inside virtual machines.")
+    return h.ptr
+end
 
 """Name of the kpep database for this CPU, e.g. `"as12"`."""
 function db_name()
