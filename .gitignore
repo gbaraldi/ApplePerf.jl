@@ -5,3 +5,4 @@ Manifest.toml
 *.folded
 docs/build/
 .DS_Store
+*.svg

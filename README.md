@@ -39,6 +39,12 @@ profiled process, so Julia functions, inlined callees, and `file:line` show up
 in the reports and exports. Instruments itself has no hook for JIT symbols, so
 the GUI shows Julia frames as addresses; use the exports for symbolized views.
 
+## Installation
+
+```julia
+using Pkg; Pkg.add(url = "https://github.com/gbaraldi/ApplePerf.jl")
+```
+
 ## Requirements
 
 * macOS on Apple Silicon (tested: M5, macOS 27, Xcode 16 / xctrace 16).
