@@ -22,5 +22,5 @@ end
 show(stdout, MIME"text/plain"(), res); println()
 ApplePerf.Analysis.report(res; region = "gather 8 KiB", top = 6)
 ApplePerf.Analysis.collapsed(res, "profile.folded")
-ApplePerf.Analysis.pprof(res, "profile.pb")
-println("wrote profile.folded and profile.pb; trace at ", res.trace)
+ApplePerf.Analysis.pprof(res, "profile.pb.gz")
+println("wrote profile.folded and profile.pb.gz; trace at ", res.trace)

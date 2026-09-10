@@ -16,7 +16,7 @@ res = profile() do                       # xctrace attaches to this process, no 
 end
 res                                      # per-region wall time, samples, counter metrics, top functions
 ApplePerf.Analysis.report(res; region = "gather")   # self weight per source line (JIT frames symbolized)
-ApplePerf.Analysis.pprof(res, "run.pb")             # pprof -http=: run.pb ; -tagfocus=region=gather
+ApplePerf.Analysis.pprof(res, "run.pb.gz"; web = true)   # PProf web UI; or pprof -tagfocus=region=gather run.pb.gz
 ApplePerf.Analysis.collapsed(res, "gather.folded")  # speedscope / flamegraph.pl
 open_in_instruments(res.trace)
 ```
@@ -26,7 +26,7 @@ open_in_instruments(res.trace)
 | Backend | Privileges | What you get |
 |---|---|---|
 | `KPC.measure(f, events)` | **root** | exact per-thread counter deltas around a call (2 fixed + 8 configurable counters, any of the ~136 events in Apple's kpep database); software multiplexing across repeated runs when events conflict |
-| `profile(f)` (default) | none | 1 ms timer samples with call stacks for every thread, Instruments' guided counter modes (CPU bottlenecks, L1D miss sampling, ...), joined against `@region` intervals |
+| `profile(f)` (default) | none | 1 ms timer samples with call stacks for every thread, each carrying per-sample deltas of cycles, instructions, L1D load misses and branch mispredictions, joined against `@region` intervals |
 | `profile(f; options = RecordingOptions(sample_event = "L1D_CACHE_MISS_LD_NONSPEC", threshold = 20_000))` | none | one stack sample every N occurrences of an event, so per-function / per-line attribution is in **that event's units** (misses, branch mispredicts, cycles, ...) |
 | `profile(f; options = RecordingOptions(template = "Processor Trace"))` | none, but the Julia binary needs `get-task-allow` (see `make_debuggable_julia`) | exact traced instructions and cycles per region from the M4+/M5 processor trace unit (~1 s window, drops data on branch-dense code) |
 | `profile(f; options = RecordingOptions(events = ["FIXED_CYCLES", "L1D_CACHE_MISS_LD_NONSPEC", ...]))` | none | hand-picked event list (up to 2 fixed + 8 configurable): every 1 ms sample carries the per-sample delta of each event, giving exact per-region totals and per-event attribution to functions and lines, all in one run |
@@ -97,8 +97,8 @@ the system requires name and format strings to live in a loaded image's
 ```julia
 opts = RecordingOptions(;
     template = "CPU Counters",        # or "Time Profiler", "Processor Trace", or a .tracetemplate path
-    events = String[],                # manual event list; each sample then carries per-event deltas
-    mode = "bottlenecks",             # guided counting mode for timer sampling (when `events` is empty)
+    events = ApplePerf.XCTrace.DEFAULT_EVENTS,   # per-sample event deltas; String[] switches to a guided mode
+    mode = "bottlenecks",             # guided counting mode (only when `events` is empty)
     sample_event = nothing,           # set to an event mnemonic for event-triggered sampling
     threshold = 1_000_000,            # events per sample
     high_frequency = false,
@@ -120,8 +120,9 @@ process, `XCTrace.attach(pid)` / `XCTrace.stop!`, `export_table(trace, schema)`
 
 ### pprof export
 
-`Analysis.pprof(res, path; region = nothing)` writes an uncompressed
-`profile.proto`. Sample values are `[samples, weight, counters...]`: weight in
+`Analysis.pprof(res, path; region = nothing, web = false)` writes a gzipped
+`profile.proto` through PProf.jl's protobuf types; `web = true` opens PProf's
+bundled web UI on it, and `PProf.refresh(file = path)` reopens it later. Sample values are `[samples, weight, counters...]`: weight in
 nanoseconds (timer) or trigger-event counts (event-triggered), then one column
 per event of a manual event list, selectable with `-sample_index=<EVENT>` (the
 first event is the default view). Each sample is labelled
@@ -129,10 +130,10 @@ with `thread` and with one `region` per enclosing interval, so one file serves
 all views:
 
 ```
-pprof -http=: run.pb                        # everything
-pprof -tagfocus=region=gather run.pb        # only samples inside "gather"
-pprof -tagignore=region=profile run.pb      # nothing from the outer region
-pprof -tagroot=region -top run.pb           # group by region
+pprof -http=: run.pb.gz                        # everything
+pprof -tagfocus=region=gather run.pb.gz     # only samples inside "gather"
+pprof -tagignore=region=profile run.pb.gz   # nothing from the outer region
+pprof -tagroot=region -top run.pb.gz        # group by region
 ```
 
 ### Processor Trace
@@ -151,10 +152,15 @@ tells you how much was lost.
 
 ## Caveats and things learned the hard way
 
-* **Bottleneck-mode metric values** (Cycles, Instruction Delivery / Discarded /
-  Processing Bottleneck) are Instruments' derived per-thread values, not raw
-  event counts. For raw counts use event-triggered sampling (`samples × threshold`
-  estimates the total), a custom template, or `KPC` with root.
+* **Guided-mode metric values** (`events = String[]`: Cycles, Instruction
+  Delivery / Discarded / Processing Bottleneck) are Instruments' derived
+  per-thread interval values, not raw event counts, and are not attached to
+  samples. The default manual event list gives raw per-sample counts.
+* **xctrace is slow to start and stop.** Attaching takes about 2.3 s, stopping
+  and saving about 2.5 s, and every `xctrace export` invocation about 2 s
+  regardless of table size. `analyze` therefore makes exactly two invocations
+  (toc, then all tables in one export); a `profile` call costs roughly 8 s on
+  top of the workload.
 * **How manual event lists reach xctrace.** `--recording-options` (Xcode 16)
   takes the same JSON the GUI stores in `.tracetemplate` files. Its
   `allEventsAndFormulas` entries are base64 `NSKeyedArchiver` blobs of

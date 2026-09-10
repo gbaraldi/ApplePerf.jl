@@ -22,5 +22,5 @@ res = profile(; options = opts) do
 end
 show(stdout, MIME"text/plain"(), res); println()
 ApplePerf.Analysis.report(res; region = "gather 128 MiB", top = 5)
-ApplePerf.Analysis.pprof(res, "l1d.pb"); ApplePerf.Analysis.collapsed(res, "l1d.folded")
+ApplePerf.Analysis.pprof(res, "l1d.pb.gz"); ApplePerf.Analysis.collapsed(res, "l1d.folded")
 println("trace: ", res.trace)

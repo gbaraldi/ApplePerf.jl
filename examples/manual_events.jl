@@ -23,5 +23,5 @@ end
 show(stdout, MIME"text/plain"(), res); println()
 ApplePerf.Analysis.report(res; region = "gather 128 MiB", top = 4, by = "L1D_CACHE_MISS_LD_NONSPEC")
 ApplePerf.Analysis.report(res; region = "gather 8 KiB", top = 4, by = "FIXED_INSTRUCTIONS")
-ApplePerf.Analysis.pprof(res, "events.pb")
+ApplePerf.Analysis.pprof(res, "events.pb.gz")
 println("trace: ", res.trace)

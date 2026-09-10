@@ -10,9 +10,10 @@ supplied).
 module Analysis
 
 using Printf, Statistics
+using PProf, ProtoBuf, CodecZlib
 using ..XCTrace
 using ..KPEP
-using ..XCTrace: XNode, Table, fmt, raw, rawint, child, colindex
+using ..XCTrace: XNode, Table, TraceInfo, fmt, raw, rawint, child, colindex
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -159,30 +160,31 @@ _pid(n::XNode) = (p = child(n, "pid"); p === nothing ? 0 : rawint(p))
 # Extraction
 # ---------------------------------------------------------------------------
 
-function _regions(trace)
-    t = XCTrace.export_table(trace, "os-signpost")
+function _regions(t::Table)
     isempty(t.rows) && return Region[]
     it = colindex(t, "Timestamp"); ity = colindex(t, "Event Type"); iid = colindex(t, "Signpost identifier")
     ith = colindex(t, "Thread"); imsg = colindex(t, "Message"); inm = colindex(t, "Name")
     isub = findfirst(==("Subsystem"), t.columns)
     open_ = Dict{Tuple{String,String},Tuple{Int,String}}()
     regs = Region[]
+    seen = Set{Tuple{Int,String,String,String}}()     # the same event appears once per table instance
     for r in sort(t.rows; by = r -> rawint(r[it]))
         isub !== nothing && fmt(r[isub]) != "org.julialang.ApplePerf" && !occursin("julia", fmt(r[isub])) && continue
-        tid = _tid(r[ith]); id = fmt(r[iid]); ty = fmt(r[ity])
+        tid = _tid(r[ith]); id = fmt(r[iid]); ty = fmt(r[ity]); time = rawint(r[it])
+        (time, tid, id, ty) in seen && continue
+        push!(seen, (time, tid, id, ty))
         name = fmt(r[imsg]); isempty(name) && (name = fmt(r[inm]))
         if ty == "Begin"
-            open_[(tid, id)] = (rawint(r[it]), name)
+            open_[(tid, id)] = (time, name)
         elseif ty == "End" && haskey(open_, (tid, id))
             s, nm = pop!(open_, (tid, id))
-            push!(regs, Region(nm, id, tid, s, rawint(r[it])))
+            push!(regs, Region(nm, id, tid, s, time))
         end
     end
     return regs
 end
 
-function _samples_time_profile(trace, symbolize_jit)
-    t = XCTrace.export_table(trace, "time-profile")
+function _samples_time_profile(t::Table, symbolize_jit)
     out = Sample[]
     isempty(t.rows) && return out
     it = colindex(t, "Sample Time"); ith = colindex(t, "Thread"); iw = colindex(t, "Weight"); ib = colindex(t, "Backtrace")
@@ -194,8 +196,7 @@ function _samples_time_profile(trace, symbolize_jit)
 end
 
 # counters-profile: PMI (event) samples or timer samples with counter arrays
-function _samples_counters_profile(trace, symbolize_jit)
-    t = XCTrace.export_table(trace, "counters-profile")
+function _samples_counters_profile(t::Table, symbolize_jit)
     out = Sample[]
     isempty(t.rows) && return out
     it = colindex(t, "Sample Time"); ith = colindex(t, "Thread"); iw = colindex(t, "Weight"); ib = colindex(t, "Backtrace")
@@ -213,8 +214,7 @@ function _samples_counters_profile(trace, symbolize_jit)
     return out
 end
 
-function _counter_rows(trace)
-    t = XCTrace.export_table(trace, "CounterMetricByThread")
+function _counter_rows(t::Table)
     out = Sample[]
     isempty(t.rows) && return out
     it = colindex(t, "Timestamp"); id = colindex(t, "Duration"); ith = colindex(t, "Thread"); iv = colindex(t, "Value")
@@ -225,8 +225,8 @@ function _counter_rows(trace)
     return out
 end
 
-function _metric_names(trace)
-    toc = XCTrace.toc(trace)
+function _metric_names(ti::TraceInfo)
+    toc = ti.toc
     m = match(r"metricLegend: \\?&quot;(.*?)\\?&quot;", toc)
     names = String[]
     if m !== nothing
@@ -237,12 +237,11 @@ function _metric_names(trace)
     return names
 end
 
-function _pt(trace)
+function _pt(tabs::Dict{String,Table})
     pts = Tuple{Int,String,Int,Int}[]
     gaps = Tuple{Int,String}[]
-    tables = XCTrace.list_tables(trace)
-    if "processor-trace-points" in tables
-        t = XCTrace.export_table(trace, "processor-trace-points")
+    if haskey(tabs, "processor-trace-points")
+        t = tabs["processor-trace-points"]
         if !isempty(t.rows)
             it = colindex(t, "Timestamp"); ith = colindex(t, "Thread"); ii = colindex(t, "Instructions"); ic = colindex(t, "Cycles")
             for r in t.rows
@@ -250,8 +249,8 @@ function _pt(trace)
             end
         end
     end
-    if "processor-trace-gaps" in tables
-        XCTrace.export_table(trace, "processor-trace-gaps") do cols, r
+    if haskey(tabs, "processor-trace-gaps")
+        for r in tabs["processor-trace-gaps"].rows
             push!(gaps, (rawint(r[1]), _tid(r[3])))
         end
     end
@@ -277,14 +276,18 @@ unnamed frames against the *current* process, which is only meaningful for a
 trace of this very process (as `profile` does).
 """
 function analyze(trace::AbstractString; symbolize_jit::Bool = true, template::AbstractString = "", pid::Integer = getpid())
-    tables = XCTrace.list_tables(trace)
-    regions = "os-signpost" in tables ? _regions(trace) : Region[]
+    ti = XCTrace.info(trace)                       # one xctrace call for the toc
+    tables = XCTrace.list_tables(ti)
+    wanted = filter(in(tables), ["os-signpost", "counters-profile", "time-profile", "CounterMetricByThread", "processor-trace-points", "processor-trace-gaps"])
+    "counters-profile" in wanted && filter!(!=("time-profile"), wanted)   # counters-profile supersedes it
+    tabs = XCTrace.export_tables(ti, wanted)       # one xctrace call for every table we need
+    regions = haskey(tabs, "os-signpost") ? _regions(tabs["os-signpost"]) : Region[]
     samples = Sample[]
     unit = "ns"; label = "time"
     counter_names = String[]
-    if "counters-profile" in tables
-        samples = _samples_counters_profile(trace, symbolize_jit)
-        attrs = XCTrace.table_attributes(trace, "counters-profile")
+    if haskey(tabs, "counters-profile")
+        samples = _samples_counters_profile(tabs["counters-profile"], symbolize_jit)
+        attrs = XCTrace.table_attributes(ti, "counters-profile")
         if get(attrs, "trigger", "") == "pmi"
             unit = replace(get(attrs, "pmi-event", "event"), "\"" => "", "&quot;" => "")
             label = unit
@@ -293,17 +296,17 @@ function analyze(trace::AbstractString; symbolize_jit::Bool = true, template::Ab
         # Instruments reports events by alias where one exists ("Cycles"); normalise to mnemonics
         isempty(strip(pmc)) || (counter_names = [_mnemonic(n) for n in split(strip(pmc), r"[ ,]+")])
     end
-    if isempty(samples) && "time-profile" in tables
-        samples = _samples_time_profile(trace, symbolize_jit)
+    if isempty(samples) && haskey(tabs, "time-profile")
+        samples = _samples_time_profile(tabs["time-profile"], symbolize_jit)
     end
-    crows = "CounterMetricByThread" in tables ? _counter_rows(trace) : Sample[]
+    crows = haskey(tabs, "CounterMetricByThread") ? _counter_rows(tabs["CounterMetricByThread"]) : Sample[]
     if !isempty(crows)
-        counter_names = _metric_names(trace)
+        counter_names = _metric_names(ti)
         n = length(crows[1].values)
         length(counter_names) >= n || (counter_names = ["metric$(i-1)" for i in 1:n])
         counter_names = counter_names[1:n]
     end
-    pts, gaps = _pt(trace)
+    pts, gaps = _pt(tabs)
     return ProfileResult(String(trace), String(template), unit, label, regions, samples, counter_names, crows, pts, gaps, pid)
 end
 
@@ -550,55 +553,40 @@ function collapsed(res::ProfileResult, path::AbstractString; region = nothing, i
     return path
 end
 
-# --- minimal protobuf writer for pprof's profile.proto -----------------------
+# --- pprof via PProf.jl's protobuf types ----------------------------------------
 
-function _varint!(io::IO, v::Integer)
-    v = UInt64(v)
-    while v >= 0x80
-        write(io, UInt8(v & 0x7f) | 0x80); v >>= 7
-    end
-    write(io, UInt8(v))
-end
-_key!(io, field, wt) = _varint!(io, (field << 3) | wt)
-_field_varint!(io, field, v) = (_key!(io, field, 0); _varint!(io, v))
-_field_bytes!(io, field, b::Vector{UInt8}) = (_key!(io, field, 2); _varint!(io, length(b)); write(io, b))
-_field_str!(io, field, s::AbstractString) = _field_bytes!(io, field, Vector{UInt8}(codeunits(s)))
-_field_msg!(io, field, f::Function) = (b = IOBuffer(); f(b); _field_bytes!(io, field, take!(b)))
-function _field_packed!(io, field, vs)
-    b = IOBuffer(); for v in vs; _varint!(b, v); end
-    _field_bytes!(io, field, take!(b))
-end
+const PB = PProf.perftools.profiles
 
 """
-    pprof(result, path; region = nothing)
+    pprof(result, path = "profile.pb.gz"; region = nothing, web = false, webhost = "localhost", webport = 57599)
 
-Write a pprof profile (`profile.proto`, uncompressed). View with
-`pprof -http=: file.pb` or `go tool pprof`. JIT frames are symbolized, inlined
-frames become multi-line locations. Sample values are `[samples, weight]`
-where weight is time in nanoseconds or the trigger event count.
+Write a gzipped pprof profile using PProf.jl's `profile.proto` types. View with
+`PProf.refresh(file = path)`, `pprof -http=: path`, or pass `web = true` to
+start PProf's bundled web UI right away.
 
-When the recording had a manual event list, every counter becomes an extra
-sample type (`<EVENT>/count`), so `-sample_index=L1D_CACHE_MISS_LD_NONSPEC`
-switches the whole view to that event; the first counter is the default view.
+Sample values are `[samples, weight, counters...]`: weight is time in
+nanoseconds (timer sampling) or trigger-event counts (event-triggered), then
+one column per event of a manual event list, selectable in pprof with
+`-sample_index=<EVENT>`; the first event is the default view. JIT frames are
+symbolized and inlined frames become multi-line locations.
 
 Every sample carries a `thread` label and one `region` label per enclosing
-region, so a single export can be sliced inside pprof:
-`pprof -tagfocus=region=gather file.pb`, `-tagignore=region=profile`,
-`-tagroot=region` or `-tagroot=thread` to group the graph.
+region: `-tagfocus=region=gather`, `-tagignore=region=profile`, `-tagroot=region`.
 """
-function pprof(res::ProfileResult, path::AbstractString; region = nothing)
+function pprof(res::ProfileResult, path::AbstractString = "profile.pb.gz"; region = nothing, web::Bool = false,
+               webhost::AbstractString = "localhost", webport::Integer = 57599)
     strings = String[""]; sidx = Dict{String,Int}("" => 0)
     str(s) = get!(sidx, s) do; push!(strings, s); length(strings) - 1; end
     funcs = Dict{Tuple{String,String},Int}()            # (name, file) -> id
     locs = Dict{Vector{Tuple{Int,Int}},Int}()           # [(func_id, line)...] -> id
     locaddr = Dict{Int,UInt64}()
-    samples_out = Vector{Tuple{Vector{Int},Vector{Int},Vector{Tuple{Int,Int}}}}()   # (locations, values, labels as (key idx, str idx))
+    pbsamples = PB.Sample[]
+    k_thread = str("thread"); k_region = str("region")
     for s in samples(res, region)
         isempty(s.stack) && continue
-        ids = Int[]
-        # group inlined frames with their caller into one Location
+        ids = UInt64[]
         i = 1
-        while i <= length(s.stack)
+        while i <= length(s.stack)                       # inlined frames join their caller's location
             j = i
             while j < length(s.stack) && s.stack[j].inlined; j += 1; end
             lines = Tuple{Int,Int}[]
@@ -611,60 +599,44 @@ function pprof(res::ProfileResult, path::AbstractString; region = nothing)
             push!(ids, lid)
             i = j + 1
         end
-        labels = Tuple{Int,Int}[(str("thread"), str(s.tid))]
+        vals = Int64[1, s.weight]
+        for c in eachindex(res.counter_names)
+            push!(vals, c <= length(s.values) ? s.values[c] : 0)
+        end
+        labels = PB.Label[PB.Label(key = k_thread, str = str(s.tid))]
         for nm in enclosing(res, s)
-            push!(labels, (str("region"), str(nm)))
+            push!(labels, PB.Label(key = k_region, str = str(nm)))
         end
-        vals = Int[1, s.weight]
-        for i in eachindex(res.counter_names)
-            push!(vals, i <= length(s.values) ? s.values[i] : 0)
-        end
-        push!(samples_out, (ids, vals, labels))
+        push!(pbsamples, PB.Sample(location_id = ids, value = vals, label = labels))
     end
     unit = res.weight_unit == "ns" ? "nanoseconds" : "count"
-    # intern every string before the string table is written
-    s_samples = str("samples"); s_count = str("count"); s_label = str(res.weight_label); s_unit = str(unit); s_julia = str("julia")
-    s_comment = str("ApplePerf.jl: " * res.template * " trace " * res.trace)
-    s_counters = [str(c) for c in res.counter_names]; s_cnt = str("count")
-    s_default = isempty(s_counters) ? s_label : s_counters[1]
-    fnames = Dict(fid => (str(name), str(file)) for ((name, file), fid) in funcs)
-    open(path, "w") do io
-        _field_msg!(io, 1, b -> (_field_varint!(b, 1, s_samples); _field_varint!(b, 2, s_count)))
-        _field_msg!(io, 1, b -> (_field_varint!(b, 1, s_label); _field_varint!(b, 2, s_unit)))
-        for sc in s_counters
-            _field_msg!(io, 1, b -> (_field_varint!(b, 1, sc); _field_varint!(b, 2, s_cnt)))
-        end
-        for (ids, vals, labels) in samples_out
-            _field_msg!(io, 2, b -> begin
-                _field_packed!(b, 1, ids); _field_packed!(b, 2, vals)
-                for (k, v) in labels
-                    _field_msg!(b, 3, bb -> (_field_varint!(bb, 1, k); _field_varint!(bb, 2, v)))
-                end
-            end)
-        end
-        _field_msg!(io, 3, b -> (_field_varint!(b, 1, 1); _field_varint!(b, 2, 0); _field_varint!(b, 3, typemax(UInt64) >> 1); _field_varint!(b, 5, s_julia);
-                                 # has_functions / has_filenames / has_line_numbers: already symbolized, pprof must not try
-                                 _field_varint!(b, 7, 1); _field_varint!(b, 8, 1); _field_varint!(b, 9, 1)))
-        for (lines, lid) in sort(collect(locs); by = last)
-            _field_msg!(io, 4, b -> begin
-                _field_varint!(b, 1, lid); _field_varint!(b, 2, 1); _field_varint!(b, 3, locaddr[lid])
-                for (fid, line) in lines
-                    _field_msg!(b, 4, bb -> (_field_varint!(bb, 1, fid); _field_varint!(bb, 2, line)))
-                end
-            end)
-        end
-        for fid in sort(collect(keys(fnames)))
-            sn, sf = fnames[fid]
-            _field_msg!(io, 5, b -> (_field_varint!(b, 1, fid); _field_varint!(b, 2, sn); _field_varint!(b, 3, sn); _field_varint!(b, 4, sf)))
-        end
-        for s in strings
-            _field_str!(io, 6, s)
-        end
-        _field_varint!(io, 9, round(Int, time() * 1e9))
-        _field_msg!(io, 11, b -> (_field_varint!(b, 1, s_label); _field_varint!(b, 2, s_unit)))
-        _field_varint!(io, 13, s_comment)
-        _field_varint!(io, 14, s_default)   # default_sample_type
+    sample_type = PB.ValueType[PB.ValueType(var"#type" = str("samples"), unit = str("count")),
+                               PB.ValueType(var"#type" = str(res.weight_label), unit = str(unit))]
+    for c in res.counter_names
+        push!(sample_type, PB.ValueType(var"#type" = str(c), unit = str("count")))
     end
+    locations = [PB.Location(id = lid, mapping_id = 1, address = locaddr[lid],
+                             line = [PB.Line(function_id = fid, line = ln) for (fid, ln) in lines])
+                 for (lines, lid) in sort(collect(locs); by = last)]
+    functions = [PB.var"Function"(id = fid, name = str(name), system_name = str(name), filename = str(file))
+                 for ((name, file), fid) in sort(collect(funcs); by = last)]
+    mapping = [PB.Mapping(id = 1, memory_start = 0, memory_limit = typemax(UInt64) >> 1, filename = str("julia"),
+                          has_functions = true, has_filenames = true, has_line_numbers = true, has_inline_frames = true)]
+    comment = [str("ApplePerf.jl: " * res.template * " trace " * res.trace)]
+    prof = PB.Profile(sample_type = sample_type, sample = pbsamples, mapping = mapping, location = locations,
+                      var"#function" = functions, string_table = strings, drop_frames = 0, keep_frames = 0,
+                      time_nanos = round(Int, time() * 1e9), duration_nanos = 0,
+                      period_type = PB.ValueType(var"#type" = str(res.weight_label), unit = str(unit)), period = 0,
+                      comment = comment,
+                      # index into the string table of the preferred value type's name
+                      default_sample_type = str(isempty(res.counter_names) ? res.weight_label : res.counter_names[1]))
+    io = GzipCompressorStream(open(path, "w"))
+    try
+        ProtoBuf.encode(ProtoBuf.ProtoEncoder(io), prof)
+    finally
+        close(io)
+    end
+    web && PProf.refresh(; webhost, webport, file = path)
     return path
 end
 

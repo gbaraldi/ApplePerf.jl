@@ -68,11 +68,11 @@ ApplePerf.Analysis.report(res; region = "sum by rows (stride 4096)", top = 3, by
 ApplePerf.Analysis.report(res; region = "count_pos random", top = 3, by = "BRANCH_MISPRED_NONSPEC")
 
 banner("6. Export for pprof / speedscope")
-pb = joinpath(pwd(), "demo.pb"); folded = joinpath(pwd(), "demo.folded")
+pb = joinpath(pwd(), "demo.pb.gz"); folded = joinpath(pwd(), "demo.folded")
 ApplePerf.Analysis.pprof(res, pb)
 ApplePerf.Analysis.collapsed(res, folded; by = "L1D_CACHE_MISS_LD_NONSPEC")
 println("wrote ", pb, " and ", folded)
-println("  pprof -http=: ", pb, "                       # cycles by default")
+println("  julia> using PProf; PProf.refresh(file = \"", pb, "\")     # or: pprof -http=: ", pb)
 println("  pprof -sample_index=BRANCH_MISPRED_NONSPEC -tagfocus='region=count_pos random' -top ", pb)
 println("  speedscope ", folded, "                         # flame graph weighted by L1D misses")
 

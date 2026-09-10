@@ -31,7 +31,8 @@ using ApplePerf, Test
 
     @testset "recording options" begin
         j = ApplePerf.XCTrace.options_json(RecordingOptions())
-        @test occursin("\"sampleByTime\":true", j)
+        @test occursin("\"sampleByTime\":true", j) && occursin("\"manual\"", j)
+        @test occursin("\"guided\"", ApplePerf.XCTrace.options_json(RecordingOptions(events = String[])))
         j = ApplePerf.XCTrace.options_json(RecordingOptions(sample_event = "CORE_ACTIVE_CYCLE", threshold = 1000))
         @test occursin("\"pmiThreshold\":1000", j) && occursin("\"sampleByTime\":false", j)
         @test_throws ArgumentError ApplePerf.XCTrace.options_json(RecordingOptions(sample_event = "FIXED_CYCLES"))
@@ -59,8 +60,10 @@ using ApplePerf, Test
             regs = ApplePerf.Analysis.regions(res)
             @test any(r -> r.name == "sum" && r.count > 10, regs)
             @test !isempty(res.samples)
+            @test "FIXED_CYCLES" in res.counter_names
+            @test ApplePerf.Analysis.counters(res, "sum")["FIXED_CYCLES"] > 10^6
             @test any(p -> occursin("mapreduce", p.first) || occursin("sum", p.first), ApplePerf.Analysis.by_function(res))
-            pb = tempname() * ".pb"; ApplePerf.Analysis.pprof(res, pb); @test filesize(pb) > 100
+            pb = tempname() * ".pb.gz"; ApplePerf.Analysis.pprof(res, pb); @test filesize(pb) > 100
             fo = tempname() * ".folded"; ApplePerf.Analysis.collapsed(res, fo); @test filesize(fo) > 10
             rm(res.trace; recursive = true, force = true)
         else

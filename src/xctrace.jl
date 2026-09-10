@@ -42,6 +42,9 @@ instruments() = [String(strip(l)) for l in split(read(`$(xctrace_path()) list in
 # Recording options
 # ---------------------------------------------------------------------------
 
+"""Events recorded by default: every sample carries their per-sample deltas."""
+const DEFAULT_EVENTS = ["FIXED_CYCLES", "FIXED_INSTRUCTIONS", "L1D_CACHE_MISS_LD_NONSPEC", "BRANCH_MISPRED_NONSPEC"]
+
 """
     RecordingOptions(; kwargs...)
 
@@ -51,18 +54,21 @@ Options for the *CPU Counters* instrument, written to the JSON file that
 Two sampling strategies:
 
 * **timer** (default): every thread is sampled every 1 ms (`high_frequency`
-  raises this). Sample weights are time. Counters are read in a *guided*
-  counting mode chosen by `mode`, e.g. `"bottlenecks"` (Cycles, Instruction
-  Delivery / Discarded / Processing bottleneck), `"l1d_miss_sampling"`,
-  `"delivery"`, `"processing"`, `"discarded_sampling"`, `"sme_streaming"`.
+  raises this). Sample weights are time, and each sample carries the
+  per-sample deltas of `events` (default `DEFAULT_EVENTS`: cycles,
+  instructions, L1D load misses, branch mispredictions). With
+  `events = String[]` Instruments' *guided* counting mode `mode` is used
+  instead, e.g. `"bottlenecks"` (Cycles, Instruction Delivery / Discarded /
+  Processing bottleneck), `"l1d_miss_sampling"`, `"delivery"`, `"processing"`,
+  `"discarded_sampling"`, `"sme_streaming"`; those are derived interval
+  metrics without per-sample values.
 * **event** (`sample_event = "CORE_ACTIVE_CYCLE"`, `threshold = 200_000`):
   a sample with a call stack is taken every `threshold` occurrences of the
   event on the profiled thread. Sample weights are then event counts, so
   per-function / per-line attribution is in that event's units. Configurable
   events only (`FIXED_*` are rejected by Instruments as PMI triggers).
 
-Independently of the strategy, `events = ["FIXED_CYCLES", "L1D_CACHE_MISS_LD_NONSPEC", ...]`
-selects a *manual* event list (up to 2 fixed + 8 configurable, checked with
+`events` may hold up to 2 fixed + 8 configurable events (checked with
 `KPEP.can_coexist`). Every sample then carries the per-sample delta of each
 event (`Sample.values`), giving exact per-region totals and per-function /
 per-line attribution for several events at once. Events are transmitted the
@@ -79,7 +85,7 @@ Base.@kwdef struct RecordingOptions
     mode::String = "bottlenecks"
     sample_event::Union{Nothing,String} = nothing
     threshold::Int = 1_000_000
-    events::Vector{String} = String[]
+    events::Vector{String} = copy(DEFAULT_EVENTS)
     high_frequency::Bool = false
     kernel::Bool = false
     debug_info::Bool = false
@@ -295,20 +301,47 @@ open_in_instruments(trace::AbstractString) = run(`open -a Instruments $trace`; w
 # Export
 # ---------------------------------------------------------------------------
 
-"""Schemas (table names) present in a trace's first run."""
-function list_tables(trace::AbstractString)
-    toc = read(`$(xctrace_path()) export --input $trace --toc`, String)
-    return unique!(sort!([m[1] for m in eachmatch(r"schema=\"([^\"]+)\"", toc)]))
+"""
+    TraceInfo
+
+Parsed table of contents of a trace's first run: the raw toc XML, the ordered
+list of `<table>` entries (index = position, as used by export xpaths) with
+their schema and attributes. Every xctrace call costs about two seconds, so
+fetch this once with `info(trace)` and pass it around.
+"""
+struct TraceInfo
+    trace::String
+    toc::String
+    schemas::Vector{String}                  # per table index
+    attributes::Vector{Dict{String,String}}  # per table index
 end
 
+function info(trace::AbstractString; run::Integer = 1)
+    toc = read(`$(xctrace_path()) export --input $trace --toc`, String)
+    m = match(Regex("<run number=\"$run\".*?</run>", "s"), toc)
+    body = m === nothing ? toc : m.match
+    d = match(r"<data>.*?</data>"s, body)
+    data = d === nothing ? body : d.match
+    schemas = String[]; attrs = Dict{String,String}[]
+    for t in eachmatch(r"<table ([^>]*)>", data)
+        a = Dict(x[1] => x[2] for x in eachmatch(r"([a-z\-]+)=\"([^\"]*)\"", t[1]))
+        push!(schemas, get(a, "schema", "")); push!(attrs, a)
+    end
+    return TraceInfo(String(trace), toc, schemas, attrs)
+end
+
+"""Schemas (table names) present in a trace's first run."""
+list_tables(trace::AbstractString) = list_tables(info(trace))
+list_tables(ti::TraceInfo) = unique!(sort!(filter(!isempty, copy(ti.schemas))))
+
 """Raw table-of-contents XML."""
-toc(trace::AbstractString) = read(`$(xctrace_path()) export --input $trace --toc`, String)
+toc(trace::AbstractString) = info(trace).toc
 
 """Attributes recorded on a table's schema entry in the toc (e.g. `pmi-event`, `pmc-events`, `sample-rate-micro-seconds`)."""
-function table_attributes(trace::AbstractString, schema::AbstractString)
-    for m in eachmatch(r"<table ([^>]*)>", toc(trace))
-        occursin("schema=\"$schema\"", m[1]) || continue
-        return Dict(a[1] => a[2] for a in eachmatch(r"([a-z\-]+)=\"([^\"]*)\"", m[1]))
+table_attributes(trace::AbstractString, schema::AbstractString) = table_attributes(info(trace), schema)
+function table_attributes(ti::TraceInfo, schema::AbstractString)
+    for (i, s) in enumerate(ti.schemas)
+        s == schema && return ti.attributes[i]
     end
     return Dict{String,String}()
 end
@@ -384,50 +417,119 @@ function colindex(t::Table, name::AbstractString)
 end
 Base.getindex(row::Vector{XNode}, t::Table, name::AbstractString) = row[colindex(t, name)]
 
-"""
-    export_table(trace, schema; run = 1) -> Table
-    export_table(f, trace, schema; run = 1)
+# xctrace prints the `<schema>` header (column names) only for the *first* table
+# of a multi-table export. Column names for the tables we rely on, keyed by
+# schema, so the others can be labelled without another two-second invocation.
+const KNOWN_COLUMNS = Dict(
+    "os-signpost" => ["Timestamp", "Thread", "Process", "Event Type", "Scope", "Signpost identifier", "Name", "Format String", "Backtrace", "Subsystem", "Category", "Message", "Emit Location"],
+    "counters-profile" => ["Sample Time", "Thread", "Process", "Core", "State", "Backtrace", "Weight", "Counter Value Array"],
+    "time-profile" => ["Sample Time", "Thread", "Process", "Core", "State", "Weight", "Backtrace"],
+    "CounterMetricByThread" => ["Timestamp", "Duration", "Process", "Thread", "Core", "Value"],
+    "processor-trace-points" => ["Timestamp", "Process", "Thread", "Instructions", "Cycles"],
+)
 
-Export one table of a trace. The second form streams: `f(columns, row)` is
-called per row without keeping the table in memory (use it for very large
-tables such as `processor-trace-intervals`).
-"""
-function export_table(f::Function, trace::AbstractString, schema::AbstractString; run::Integer = 1)
+function _stream_export(f::Function, ti::TraceInfo, schemas::Vector{String}, run::Integer)
     xml = tempname() * ".xml"
-    xpath = "/trace-toc/run[@number=\"$run\"]/data/table[@schema=\"$schema\"]"
-    Base.run(pipeline(`$(xctrace_path()) export --input $trace --xpath $xpath`; stdout = xml))
-    columns = String[]; mnemonics = String[]
-    store = Dict{String,XNode}()
+    pred = join(["@schema=\"$s\"" for s in schemas], " or ")
+    xpath = "/trace-toc/run[@number=\"$run\"]/data/table[$pred]"
+    Base.run(pipeline(`$(xctrace_path()) export --input $(ti.trace) --xpath $xpath`; stdout = xml))
+    headers = Dict{String,Tuple{Vector{String},Vector{String}}}()   # schema -> (columns, mnemonics)
+    store = Dict{String,XNode}()                                     # ids are global across the export
     reader = open(EzXML.StreamReader, xml)
+    current = ""
     try
         for typ in reader
             typ == EzXML.READER_ELEMENT || continue
             nm = nodename(reader)
-            if nm == "col"
+            if nm == "node"
+                # xpath='//trace-toc[1]/run[1]/data[1]/table[N]' -> schema via the toc order
+                m = match(r"table\[(\d+)\]", reader["xpath"])
+                idx = m === nothing ? 0 : parse(Int, m[1])
+                current = 1 <= idx <= length(ti.schemas) ? ti.schemas[idx] : ""
+            elseif nm == "schema"
+                haskey(reader, "name") && (current = reader["name"])
+                get!(headers, current, (String[], String[]))
+            elseif nm == "col"
                 node = expandtree(reader)
+                cols, mns = get!(headers, current, (String[], String[]))
                 for c in eachelement(node)
-                    nodename(c) == "name" && push!(columns, nodecontent(c))
-                    nodename(c) == "mnemonic" && push!(mnemonics, nodecontent(c))
+                    nodename(c) == "name" && push!(cols, nodecontent(c))
+                    nodename(c) == "mnemonic" && push!(mns, nodecontent(c))
                 end
             elseif nm == "row"
                 node = expandtree(reader)
-                cells = XNode[_convert(c, store) for c in eachelement(node)]
-                f(columns, cells)
+                f(current, XNode[_convert(c, store) for c in eachelement(node)])
             end
         end
     finally
         close(reader)
         rm(xml; force = true)
     end
-    return columns, mnemonics
+    return headers
 end
 
-function export_table(trace::AbstractString, schema::AbstractString; run::Integer = 1)
-    rows = Vector{XNode}[]
-    columns, mnemonics = export_table(trace, schema; run) do _, cells
-        push!(rows, cells)
+"""
+    export_tables(trace_or_info, schemas; run = 1) -> Dict{String,Table}
+
+Export several tables in **one** xctrace invocation (each invocation costs
+about two seconds regardless of size). A schema may be backed by several table
+instances in the trace (e.g. one per target); rows from all of them are
+included, so expect duplicates in event tables such as `os-signpost`.
+"""
+function export_tables(ti::TraceInfo, schemas; run::Integer = 1)
+    schemas = unique(String[s for s in schemas if s in ti.schemas])
+    out = Dict{String,Table}()
+    isempty(schemas) && return out
+    rows = Dict{String,Vector{Vector{XNode}}}()
+    headers = _stream_export(ti, schemas, run) do schema, cells
+        push!(get!(rows, schema, Vector{XNode}[]), cells)
     end
-    return Table(String(schema), columns, mnemonics, rows)
+    for s in schemas
+        cols, mns = get(headers, s, (String[], String[]))
+        rs = get(rows, s, Vector{XNode}[])
+        if isempty(cols) && !isempty(rs)
+            known = get(KNOWN_COLUMNS, s, nothing)
+            if known !== nothing && length(known) == length(rs[1])
+                cols = copy(known)
+            else
+                # unknown schema without header: one more invocation, for this table alone
+                cols, mns = _stream_export((_, _) -> nothing, ti, [s], run)[s]
+            end
+        end
+        out[s] = Table(s, cols, mns, rs)
+    end
+    return out
 end
+export_tables(trace::AbstractString, schemas; run::Integer = 1) = export_tables(info(trace), schemas; run)
+
+"""
+    export_table(trace, schema; run = 1) -> Table
+    export_table(f, trace, schema; run = 1)
+
+Export one table. The second form streams `f(columns, cells)` per row without
+keeping the table in memory (for very large tables such as
+`processor-trace-intervals`). Prefer `export_tables` when you need several.
+"""
+function export_table(f::Function, trace::Union{AbstractString,TraceInfo}, schema::AbstractString; run::Integer = 1)
+    ti = trace isa TraceInfo ? trace : info(trace)
+    schema in ti.schemas || return (String[], String[])
+    cols = String[]
+    pending = Vector{XNode}[]
+    headers = _stream_export(ti, [String(schema)], run) do _, cells
+        if isempty(cols)
+            push!(pending, cells)      # header not yet known (it precedes rows, but be safe)
+        else
+            f(cols, cells)
+        end
+        if !isempty(pending) && !isempty(cols)
+            for c in pending; f(cols, c); end; empty!(pending)
+        end
+    end
+    h = get(headers, String(schema), (String[], String[]))
+    append!(cols, h[1])
+    for c in pending; f(cols, c); end
+    return h
+end
+export_table(trace::Union{AbstractString,TraceInfo}, schema::AbstractString; run::Integer = 1) = export_tables(trace, [String(schema)]; run)[String(schema)]
 
 end # module XCTrace
