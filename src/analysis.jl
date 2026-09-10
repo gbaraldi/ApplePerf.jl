@@ -9,8 +9,10 @@ supplied).
 """
 module Analysis
 
-using Printf, Statistics
+using Printf, Statistics, Profile
 using PProf, ProtoBuf, CodecZlib
+using FlameGraphs, ProfileSVG, Colors
+using Base.StackTraces: StackFrame
 using ..XCTrace
 using ..KPEP
 using ..XCTrace: XNode, Table, TraceInfo, fmt, raw, rawint, child, colindex
@@ -633,118 +635,145 @@ function bottleneck_table(res::ProfileResult; region = nothing, top::Integer = 1
     end
 end
 
-# --- flame graph SVG, colored by bottleneck / counter -----------------------
+# --- flame graphs via FlameGraphs.jl + ProfileSVG.jl --------------------------
+#
+# FlameGraphs builds its tree from a Profile-style buffer of instruction
+# pointers. Our samples are already symbolized, so we synthesize one pointer
+# per distinct *call path* node; that makes FlameGraphs' nodes coincide with
+# ours and lets the color callback look up per-node bottleneck/counter data
+# through `StackFrame.pointer`.
 
-mutable struct _FNode
-    name::String
-    weight::Float64
+struct _NodeStats
     n::Int
+    weight::Float64
     vals::Vector{Float64}
-    children::Dict{String,_FNode}
-end
-_FNode(name, k) = _FNode(name, 0.0, 0, zeros(k), Dict{String,_FNode}())
-
-const REMARK_COLORS = Dict(
-    "High Delivery Bottleneck" => (66, 133, 244),     # blue: front end / delivery
-    "High Discarded" => (219, 68, 55),                # red: bad speculation
-    "High Processing Bottleneck" => (244, 160, 0),    # orange: back end / memory
-)
-
-function _blend(node::_FNode, names)
-    node.n == 0 && return (160, 160, 160)
-    r = g = b = 0.0; covered = 0.0
-    for (i, nm) in enumerate(names)
-        c = get(REMARK_COLORS, nm, nothing); c === nothing && continue
-        f = min(node.vals[i] / node.n, 1.0); covered += f
-        r += f * c[1]; g += f * c[2]; b += f * c[3]
-    end
-    covered > 1 && (r /= covered; g /= covered; b /= covered; covered = 1.0)
-    # unflagged share is "useful" work: green
-    r += (1 - covered) * 52; g += (1 - covered) * 168; b += (1 - covered) * 83
-    return (round(Int, r), round(Int, g), round(Int, b))
-end
-
-function _heat(node::_FNode, i, maxv)
-    v = node.n == 0 ? 0.0 : node.vals[i] / node.n
-    f = maxv > 0 ? min(v / maxv, 1.0) : 0.0
-    return (round(Int, 255), round(Int, 235 - 185f), round(Int, 120 - 100f))
 end
 
 """
-    flamegraph(result, path = "flamegraph.svg"; region = nothing, by = nothing, inlined = false, width = 1400, minwidth = 0.3)
+    flamegraph_tree(result; region = nothing, inlined = false) -> (graph, stats)
 
-Write an SVG flame graph (root at the bottom, width = sample weight). Colors:
-
-* guided bottleneck mode (default `by = nothing` when remark flags exist): each
-  frame is blended from the share of its samples flagged **blue** = instruction
-  delivery, **red** = discarded (bad speculation), **orange** = instruction
-  processing (back end); unflagged, useful work is **green**.
-* `by = "L1D_CACHE_MISS_LD_NONSPEC"` (or any counter column): heat map of that
-  counter per sample, pale to dark red.
-* otherwise a flat palette.
-
-Hovering a frame shows its weight and per-column values. `minwidth` is the
-smallest frame drawn, in percent of the root.
+Build a FlameGraphs.jl graph (`LeftChildRightSiblingTrees.Node{FlameGraphs.NodeData}`)
+from the samples, plus a `Dict{UInt64,_NodeStats}` keyed by each node's
+synthetic `StackFrame.pointer`. Use the graph with ProfileSVG, ProfileView or
+any FlameGraphs consumer.
 """
-function flamegraph(res::ProfileResult, path::AbstractString = "flamegraph.svg"; region = nothing, by = nothing,
-                    inlined::Bool = false, width::Integer = 1400, minwidth::Real = 0.3)
-    names = res.counter_names; k = length(names)
-    root = _FNode("all", k)
-    maxdepth = 0
+function flamegraph_tree(res::ProfileResult; region = nothing, inlined::Bool = false)
+    k = length(res.counter_names)
+    ids = Dict{Vector{String},UInt64}()
+    lidict = Dict{UInt64,StackFrame}()
+    stats = Dict{UInt64,Vector{Float64}}()     # id -> [n, weight, vals...]
+    data = UInt64[]
+    path = String[]
     for s in samples(res, region)
         frames = inlined ? s.stack : filter(f -> !f.inlined, s.stack)
         isempty(frames) && continue
-        node = root; node.weight += s.weight; node.n += 1
-        for (i, v) in enumerate(s.values); i <= k && (node.vals[i] += v); end
-        for f in Iterators.reverse(frames)
-            node = get!(node.children, f.func) do; _FNode(f.func, k); end
-            node.weight += s.weight; node.n += 1
-            for (i, v) in enumerate(s.values); i <= k && (node.vals[i] += v); end
+        empty!(path)
+        ips = UInt64[]
+        for f in Iterators.reverse(frames)             # root -> leaf
+            push!(path, f.func)
+            id = get!(ids, copy(path)) do
+                nid = UInt64(0x1000 + length(ids))
+                lidict[nid] = StackFrame(Symbol(f.func), Symbol(f.file), f.line, nothing, false, f.inlined, nid)
+                nid
+            end
+            st = get!(stats, id) do; zeros(2 + k); end
+            st[1] += 1; st[2] += s.weight
+            for (i, v) in enumerate(s.values); i <= k && (st[i + 2] += v); end
+            push!(ips, id)
         end
-        maxdepth = max(maxdepth, length(frames))
+        append!(data, reverse!(ips))                  # Profile buffers are leaf-first
+        push!(data, 0)
     end
-    root.weight == 0 && error("no samples to draw")
-    byi = 0
+    isempty(data) && error("no samples to draw")
+    @static if isdefined(Profile, :add_fake_meta)
+        data = Profile.add_fake_meta(data)
+    end
+    g = FlameGraphs.flamegraph(data; lidict, C = true, norepl = false, pruned = [])
+    return g, Dict(id => _NodeStats(Int(v[1]), v[2], v[3:end]) for (id, v) in stats)
+end
+
+const REMARK_COLORS = Dict(
+    "High Delivery Bottleneck" => RGB(66/255, 133/255, 244/255),     # blue: front end / delivery
+    "High Discarded" => RGB(219/255, 68/255, 55/255),                # red: bad speculation
+    "High Processing Bottleneck" => RGB(244/255, 160/255, 0/255),    # orange: back end / memory
+)
+const USEFUL_COLOR = RGB(52/255, 168/255, 83/255)
+
+"""
+    BottleneckColors(stats, names) / CounterHeat(stats, index, max)
+
+ProfileSVG color callbacks driven by per-node data (see [`flamegraph`](@ref)).
+"""
+struct BottleneckColors
+    stats::Dict{UInt64,_NodeStats}
+    names::Vector{String}
+end
+function (c::BottleneckColors)(::Vector{Int}, ::Int, nd::FlameGraphs.NodeData)
+    st = get(c.stats, UInt64(nd.sf.pointer), nothing)
+    (st === nothing || st.n == 0) && return RGB(0.63, 0.63, 0.63)
+    r = g = b = 0.0; covered = 0.0
+    for (i, nm) in enumerate(c.names)
+        col = get(REMARK_COLORS, nm, nothing); col === nothing && continue
+        f = min(st.vals[i] / st.n, 1.0); covered += f
+        r += f * col.r; g += f * col.g; b += f * col.b
+    end
+    covered > 1 && (r /= covered; g /= covered; b /= covered; covered = 1.0)
+    return RGB(r + (1 - covered) * USEFUL_COLOR.r, g + (1 - covered) * USEFUL_COLOR.g, b + (1 - covered) * USEFUL_COLOR.b)
+end
+(c::BottleneckColors)(s::Symbol) = s === :bg ? RGB(0.98, 0.98, 0.98) : RGB(0, 0, 0)
+
+struct CounterHeat
+    stats::Dict{UInt64,_NodeStats}
+    index::Int
+    max::Float64
+end
+function (c::CounterHeat)(::Vector{Int}, ::Int, nd::FlameGraphs.NodeData)
+    st = get(c.stats, UInt64(nd.sf.pointer), nothing)
+    v = (st === nothing || st.n == 0) ? 0.0 : st.vals[c.index] / st.n
+    f = c.max > 0 ? min(v / c.max, 1.0) : 0.0
+    return RGB(1.0, (235 - 185f) / 255, (120 - 100f) / 255)
+end
+(c::CounterHeat)(s::Symbol) = s === :bg ? RGB(0.98, 0.98, 0.98) : RGB(0, 0, 0)
+
+"""
+    flamegraph(result, path = "flamegraph.svg"; region = nothing, by = nothing, inlined = false, width = 1400, kwargs...)
+
+Write an interactive SVG flame graph with ProfileSVG.jl (hover for details,
+click to zoom). Colors:
+
+* guided bottleneck mode (default when remark flags exist): each frame is
+  blended from the share of its samples flagged **blue** = instruction
+  delivery, **red** = discarded (bad speculation), **orange** = instruction
+  processing (back end); unflagged, useful work is **green**; delivery plus
+  discarded blends to purple.
+* `by = "L1D_CACHE_MISS_LD_NONSPEC"` (or any counter column): heat map of that
+  counter per sample, pale to dark.
+* otherwise ProfileSVG's default palette.
+
+Frame widths are sample counts. Extra `kwargs` go to `ProfileSVG.save`
+(e.g. `fontsize`, `maxdepth`, `yflip`). Use [`flamegraph_tree`](@ref) to get
+the FlameGraphs graph for other viewers.
+"""
+function flamegraph(res::ProfileResult, path::AbstractString = "flamegraph.svg"; region = nothing, by = nothing,
+                    inlined::Bool = false, width::Integer = 1400, maxdepth::Integer = 150, kwargs...)
+    g, stats = flamegraph_tree(res; region, inlined)
+    names = res.counter_names
+    title = "ApplePerf — weight: samples ($(res.weight_label))" * (region === nothing ? "" : ", region: $region")
     if by !== nothing
         i = findfirst(==(_mnemonic(by)), names)
         i === nothing && error("no counter $by in this profile; have $names")
-        byi = i
+        mx = maximum((st.n == 0 ? 0.0 : st.vals[i] / st.n for st in values(stats)); init = 0.0)
+        fcolor = CounterHeat(stats, i, mx)
+        title *= ", color: $(names[i]) per sample"
+    elseif any(n -> haskey(REMARK_COLORS, n), names)
+        fcolor = BottleneckColors(stats, names)
+        title *= ", color: blue=delivery red=discarded (purple=both) orange=processing green=useful"
+    else
+        fcolor = FlameGraphs.FlameColors()
     end
-    isflag = byi == 0 && k > 0 && any(n -> haskey(REMARK_COLORS, n), names)
-    maxv = byi == 0 ? 0.0 : maximum(n -> n.n == 0 ? 0.0 : n.vals[byi] / n.n, _allnodes(root); init = 0.0)
-    rowh = 16; pad = 10
-    height = (maxdepth + 1) * rowh + 2pad + 30
-    io = IOBuffer()
-    print(io, """<svg xmlns="http://www.w3.org/2000/svg" width="$width" height="$height" font-family="Menlo, monospace" font-size="11">
-<style>rect:hover{stroke:#000;stroke-width:1}</style>
-<rect width="100%" height="100%" fill="#fafafa"/>
-<text x="$pad" y="18" font-size="13">ApplePerf flame graph — weight: $(res.weight_label)$(byi > 0 ? ", color: $(names[byi]) per sample" : isflag ? ", color: blue=delivery red=discarded (purple=both) orange=processing green=useful" : "")$(region === nothing ? "" : ", region: $region")</text>
-""")
-    scale = (width - 2pad) / root.weight
-    fmtv(v) = res.weight_unit == "ns" ? @sprintf("%.1f ms", v / 1e6) : _commas(round(Int, v))
-    function draw(node::_FNode, x, depth)
-        w = node.weight * scale
-        w < minwidth / 100 * (width - 2pad) && return
-        y = height - pad - 30 - (depth + 1) * rowh
-        col = byi > 0 ? _heat(node, byi, maxv) : isflag ? _blend(node, names) : (205 + (hash(node.name) % 50), 120 + (hash(node.name, UInt(1)) % 80), 60)
-        detail = join(["$(nm): $(isflag ? string(round(Int, 100 * node.vals[i] / max(node.n, 1)), "% of samples") : _commas(round(Int, node.vals[i])))" for (i, nm) in enumerate(names)], "\n")
-        title = replace("$(node.name)\n$(fmtv(node.weight)) ($(round(100 * node.weight / root.weight; digits = 1))%), $(node.n) samples\n$detail", "&" => "&amp;", "<" => "&lt;")
-        label = w > 40 ? replace(first(node.name, max(1, floor(Int, w / 6.5))), "&" => "&amp;", "<" => "&lt;") : ""
-        print(io, """<g><title>$title</title><rect x="$(round(x; digits=1))" y="$y" width="$(round(w; digits=1))" height="$(rowh - 1)" fill="rgb($(col[1]),$(col[2]),$(col[3]))" rx="1"/>""")
-        isempty(label) || print(io, """<text x="$(round(x + 3; digits=1))" y="$(y + 12)" clip-path="inset(0)">$label</text>""")
-        print(io, "</g>\n")
-        cx = x
-        for c in sort(collect(values(node.children)); by = c -> c.weight, rev = true)
-            draw(c, cx, depth + 1); cx += c.weight * scale
-        end
-    end
-    draw(root, pad, 0)
-    print(io, "</svg>\n")
-    write(path, take!(io))
+    ProfileSVG.save(fcolor, path, g; width, title, maxdepth, kwargs...)
     return path
 end
-_allnodes(n::_FNode) = (nodes = _FNode[]; _collect!(nodes, n); nodes)
-_collect!(acc, n) = (push!(acc, n); for c in values(n.children); _collect!(acc, c); end)
 
 # --- pprof via PProf.jl's protobuf types ----------------------------------------
 

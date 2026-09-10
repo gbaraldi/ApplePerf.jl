@@ -88,8 +88,9 @@ end
 ApplePerf.Analysis.bottleneck_table(res2; top = 6)
 svg = joinpath(pwd(), "demo_bottlenecks.svg")
 ApplePerf.Analysis.flamegraph(res2, svg)
-println("\nflame graph colored by bottleneck (blue = instruction delivery, red = discarded/bad speculation,")
-println("orange = instruction processing/back end, green = useful): open ", svg)
+println("\ninteractive flame graph (ProfileSVG) colored by bottleneck: blue = instruction delivery,")
+println("red = discarded/bad speculation, purple = both, orange = instruction processing, green = useful")
+println("open ", svg)
 
 if "--open" in ARGS
     banner("8. Same traces in Instruments (Points of Interest shows the regions)")

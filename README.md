@@ -112,7 +112,8 @@ ApplePerf.Analysis.by_function(res; region = "gather")
 ApplePerf.Analysis.by_line(res; region = "gather", by = "L1D_CACHE_MISS_LD_NONSPEC")  # attribute a counter instead of time
 ApplePerf.Analysis.inclusive(res)
 ApplePerf.Analysis.bottleneck_table(res)   # per function: time share and per-column values (events per sample, or % flagged)
-ApplePerf.Analysis.flamegraph(res, "flame.svg"; by = "L1D_CACHE_MISS_LD_NONSPEC")  # SVG, heat by counter; guided mode colors by bottleneck
+ApplePerf.Analysis.flamegraph(res, "flame.svg"; by = "L1D_CACHE_MISS_LD_NONSPEC")  # interactive SVG via FlameGraphs.jl + ProfileSVG.jl; heat by counter, or bottleneck colors in guided mode
+ApplePerf.Analysis.flamegraph_tree(res)      # the FlameGraphs graph itself, for ProfileView and friends
 ApplePerf.Analysis.samples(res, "gather")   # raw Sample objects with symbolized stacks
 ```
 
