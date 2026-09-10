@@ -213,4 +213,5 @@ bottleneck. About 35 seconds.
 * `examples/l1d_misses.jl` — L1D-miss-triggered sampling and per-line miss attribution.
 * `examples/manual_events.jl` — five events per sample, exact per-region totals, per-event pprof columns and flame graph.
 * `examples/bottlenecks.jl` — Instruments' bottleneck analysis attributed to regions, functions and a colored flame graph.
+* `examples/counter_tour.jl` — six event groups (branches, data cache/TLB, instruction mix, front end, pipeline stalls, atomics/memory ordering), each exercised by micro-workloads that move them; run with `julia -t 4`, about 90 s, or name the groups you want.
 * `examples/kpc_root.jl` — exact counters (run with `sudo`).
