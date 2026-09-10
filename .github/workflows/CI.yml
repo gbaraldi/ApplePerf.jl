@@ -1,0 +1,25 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    # Apple Silicon runner. The xctrace-based tests need Xcode and a real PMU;
+    # they are skipped automatically when xctrace is missing, and can be forced
+    # off with APPLEPERF_TEST_XCTRACE=0.
+    runs-on: macos-15
+    strategy:
+      matrix:
+        julia-version: ['1.10', '1']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.julia-version }}
+          arch: aarch64
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
+        env:
+          APPLEPERF_TEST_XCTRACE: '0'

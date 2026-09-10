@@ -1,0 +1,7 @@
+Manifest.toml
+*.trace/
+*.pb
+*.pb.gz
+*.folded
+docs/build/
+.DS_Store
