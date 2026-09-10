@@ -76,7 +76,22 @@ println("  julia> using PProf; PProf.refresh(file = \"", pb, "\")     # or: ppro
 println("  pprof -sample_index=BRANCH_MISPRED_NONSPEC -tagfocus='region=count_pos random' -top ", pb)
 println("  speedscope ", folded, "                         # flame graph weighted by L1D misses")
 
+banner("7. Instruments' bottleneck analysis: which code is bound by what")
+res2 = profile(; options = RecordingOptions(bottlenecks = true), name = "demo") do
+    for _ in 1:3
+        @region "sum by columns (contiguous)" sum_cols(M)
+        @region "sum by rows (stride 4096)"   sum_rows(M)
+        @region "count_pos random"           count_pos(data)
+        @region "count_pos sorted"           count_pos(sorted)
+    end
+end
+ApplePerf.Analysis.bottleneck_table(res2; top = 6)
+svg = joinpath(pwd(), "demo_bottlenecks.svg")
+ApplePerf.Analysis.flamegraph(res2, svg)
+println("\nflame graph colored by bottleneck (blue = instruction delivery, red = discarded/bad speculation,")
+println("orange = instruction processing/back end, green = useful): open ", svg)
+
 if "--open" in ARGS
-    banner("7. Same trace in Instruments (Points of Interest shows the regions)")
-    open_in_instruments(res.trace)
+    banner("8. Same traces in Instruments (Points of Interest shows the regions)")
+    open_in_instruments(res.trace); open_in_instruments(res2.trace)
 end

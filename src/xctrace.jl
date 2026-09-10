@@ -85,6 +85,11 @@ Two sampling strategies:
   per-function / per-line attribution is in that event's units. Configurable
   events only (`FIXED_*` are rejected by Instruments as PMI triggers).
 
+`bottlenecks = true` is shorthand for Instruments' guided CPU-bottleneck
+analysis (`events = String[]`, `mode = "bottlenecks"`): no raw counters, but
+every sample is flagged as delivery-, discarded- or processing-bound, which
+`Analysis.bottleneck_table` and `Analysis.flamegraph` attribute to code.
+
 `events` may hold up to 2 fixed + 8 configurable events (checked with
 `KPEP.can_coexist`). Every sample then carries the per-sample delta of each
 event (`Sample.values`), giving exact per-region totals and per-function /
@@ -99,6 +104,7 @@ the JSON verbatim for options not modelled here.
 """
 Base.@kwdef struct RecordingOptions
     template::String = "CPU Counters"
+    bottlenecks::Bool = false
     mode::String = "bottlenecks"
     sample_event::Union{Nothing,String} = nothing
     threshold::Int = 1_000_000
@@ -158,7 +164,7 @@ end
 
 """JSON text for `xctrace record --recording-options`."""
 function options_json(o::RecordingOptions)
-    evs = String[KPEP.event(e).name for e in o.events]
+    evs = o.bottlenecks ? String[] : String[KPEP.event(e).name for e in o.events]
     if !isempty(evs)
         KPEP.can_coexist(evs...) || throw(ArgumentError("events cannot be counted together on this CPU: $(join(evs, ", ")). Groups that work: $(KPEP.plan_groups(evs))"))
     end

@@ -70,8 +70,9 @@ mutable struct ProfileResult
     weight_label::String                 # "time" or "L1D_CACHE_MISS_LD_NONSPEC"
     regions::Vector{Region}
     samples::Vector{Sample}
-    counter_names::Vector{String}        # names for Sample.values / counter rows
-    counter_rows::Vector{Sample}         # per-thread counter intervals (no stacks)
+    counter_names::Vector{String}        # names for Sample.values (events, or remark flags in guided modes)
+    counter_rows::Vector{Sample}         # per-thread counter intervals (no stacks), values named by metric_names
+    metric_names::Vector{String}
     pt_points::Vector{Tuple{Int,String,Int,Int}}  # (time, tid, instructions, cycles) from Processor Trace
     pt_gaps::Vector{Tuple{Int,String}}
     julia_pid::Int
@@ -301,23 +302,46 @@ function analyze(trace::AbstractString; symbolize_jit::Bool = true, template::Ab
         samples = _samples_time_profile(tabs["time-profile"], symbolize_jit)
     end
     crows = haskey(tabs, "CounterMetricByThread") ? _counter_rows(tabs["CounterMetricByThread"]) : Sample[]
+    metric_names = String[]
     if !isempty(crows)
-        counter_names = _metric_names(ti)
+        metric_names = _metric_names(ti)
         n = length(crows[1].values)
-        length(counter_names) >= n || (counter_names = ["metric$(i-1)" for i in 1:n])
-        counter_names = counter_names[1:n]
+        length(metric_names) >= n || (metric_names = ["metric$(i-1)" for i in 1:n])
+        metric_names = metric_names[1:n]
     end
     pts, gaps = _pt(tabs)
     remarks = Tuple{Int,String,String}[]
     if haskey(tabs, "CountingModeSamples") && !isempty(tabs["CountingModeSamples"].rows)
         t = tabs["CountingModeSamples"]
         it = colindex(t, "Timestamp"); ith = colindex(t, "Thread"); ir = colindex(t, "Remark")
+        ib = findfirst(==("Backtrace"), t.columns)
+        flagged = Dict{Tuple{Int,String},Vector{String}}()
         for r in t.rows
             r[ir].tag == "sentinel" && continue
-            push!(remarks, (rawint(r[it]), _tid(r[ith]), fmt(r[ir])))
+            key = (rawint(r[it]), _tid(r[ith])); nm = fmt(r[ir])
+            push!(remarks, (key[1], key[2], nm))
+            push!(get!(flagged, key, String[]), nm)
+        end
+        # Guided modes: turn the remarks into per-sample flag columns so that
+        # by_function / flamegraph / pprof can attribute bottlenecks to code.
+        if isempty(counter_names) && !isempty(flagged)
+            names = sort!(unique!([nm for (_, _, nm) in remarks]))
+            if isempty(samples) && ib !== nothing        # no time-profile: build samples from the remark rows themselves
+                seen = Set{Tuple{Int,String}}()
+                for r in t.rows
+                    key = (rawint(r[it]), _tid(r[ith])); key in seen && continue; push!(seen, key)
+                    bt = r[ib]; bt.tag == "sentinel" && continue
+                    flags = get(flagged, key, String[])
+                    push!(samples, Sample(key[1], 0, key[2], 1_000_000, _stack(bt, symbolize_jit), [count(==(n), flags) for n in names]))
+                end
+            else
+                samples = [Sample(s.time, s.duration, s.tid, s.weight, s.stack,
+                                  [count(==(n), get(flagged, (s.time, s.tid), String[])) for n in names]) for s in samples]
+            end
+            counter_names = names
         end
     end
-    return ProfileResult(String(trace), String(template), unit, label, regions, samples, counter_names, crows, pts, gaps, pid, remarks)
+    return ProfileResult(String(trace), String(template), unit, label, regions, samples, counter_names, crows, metric_names, pts, gaps, pid, remarks)
 end
 
 # ---------------------------------------------------------------------------
@@ -379,8 +403,8 @@ function regions(res::ProfileResult)
             ov > 0 || continue
             f = ov / c.duration
             for (i, v) in enumerate(c.values)
-                i <= length(res.counter_names) || break
-                cnt[res.counter_names[i]] = get(cnt, res.counter_names[i], 0.0) + v * f
+                i <= length(res.metric_names) || break
+                cnt[res.metric_names[i]] = get(cnt, res.metric_names[i], 0.0) + v * f
             end
         end
         for (t, tid, i, c) in res.pt_points, r in regs
@@ -403,8 +427,8 @@ function counters(res::ProfileResult, name = nothing)
     if name === nothing
         d = Dict{String,Float64}()
         for c in res.counter_rows, (i, v) in enumerate(c.values)
-            i <= length(res.counter_names) || break
-            d[res.counter_names[i]] = get(d, res.counter_names[i], 0.0) + v
+            i <= length(res.metric_names) || break
+            d[res.metric_names[i]] = get(d, res.metric_names[i], 0.0) + v
         end
         for s in res.samples, (i, v) in enumerate(s.values)
             i <= length(res.counter_names) || break
@@ -512,6 +536,7 @@ function Base.show(io::IO, ::MIME"text/plain", res::ProfileResult)
                     res.weight_unit == "ns" ? @sprintf("%.3f ms", r.weight / 1e6) : _commas(r.weight))
             if !isempty(r.counters)
                 for (k, v) in sort(collect(r.counters))
+                    k in keys(r.remarks) && continue          # remark flags are reported on the remarks line
                     @printf(io, "      %-40s %18s\n", k, _commas(round(Int, v)))
                 end
             end
@@ -573,6 +598,153 @@ function collapsed(res::ProfileResult, path::AbstractString; region = nothing, i
     end
     return path
 end
+
+"""
+    bottleneck_table(result; region = nothing, top = 15, io = stdout)
+
+Per function (self samples): share of time, and for every counter column the
+value per sample (for guided modes: the fraction of that function's samples
+Instruments flagged with each bottleneck remark; for manual event lists:
+events per sample). Answers "which code is bottlenecked by what".
+"""
+function bottleneck_table(res::ProfileResult; region = nothing, top::Integer = 15, io::IO = stdout)
+    ss = samples(res, region)
+    isempty(res.counter_names) && error("no per-sample counters or remarks in this profile")
+    acc = Dict{String,Vector{Float64}}()   # func -> [weight, nsamples, counters...]
+    for s in ss
+        f = _outer_leaf(s); f === nothing && continue
+        a = get!(acc, f.func, zeros(2 + length(res.counter_names)))
+        a[1] += s.weight; a[2] += 1
+        for (i, v) in enumerate(s.values); i + 2 <= length(a) && (a[i + 2] += v); end
+    end
+    tot = sum(a[1] for a in values(acc); init = 0.0)
+    isflag = !isempty(res.remarks) && all(n -> any(r -> r[3] == n, res.remarks), res.counter_names)
+    short(n) = replace(replace(n, "High " => ""), " Bottleneck" => "")
+    @printf(io, "%6s  %-44s", res.weight_label == "time" ? "time" : res.weight_label, "function")
+    for n in res.counter_names; @printf(io, " %14s", first(short(n), 14)); end
+    println(io, isflag ? "   (% of its samples flagged)" : "   (per sample)")
+    for (fn, a) in first(sort!(collect(acc); by = x -> x[2][1], rev = true), top)
+        @printf(io, "%5.1f%%  %-44s", 100a[1] / max(tot, 1), first(fn, 44))
+        for i in eachindex(res.counter_names)
+            v = a[i + 2] / max(a[2], 1)
+            isflag ? @printf(io, " %13.0f%%", 100v) : @printf(io, " %14s", _commas(round(Int, v)))
+        end
+        println(io)
+    end
+end
+
+# --- flame graph SVG, colored by bottleneck / counter -----------------------
+
+mutable struct _FNode
+    name::String
+    weight::Float64
+    n::Int
+    vals::Vector{Float64}
+    children::Dict{String,_FNode}
+end
+_FNode(name, k) = _FNode(name, 0.0, 0, zeros(k), Dict{String,_FNode}())
+
+const REMARK_COLORS = Dict(
+    "High Delivery Bottleneck" => (66, 133, 244),     # blue: front end / delivery
+    "High Discarded" => (219, 68, 55),                # red: bad speculation
+    "High Processing Bottleneck" => (244, 160, 0),    # orange: back end / memory
+)
+
+function _blend(node::_FNode, names)
+    node.n == 0 && return (160, 160, 160)
+    r = g = b = 0.0; covered = 0.0
+    for (i, nm) in enumerate(names)
+        c = get(REMARK_COLORS, nm, nothing); c === nothing && continue
+        f = min(node.vals[i] / node.n, 1.0); covered += f
+        r += f * c[1]; g += f * c[2]; b += f * c[3]
+    end
+    covered > 1 && (r /= covered; g /= covered; b /= covered; covered = 1.0)
+    # unflagged share is "useful" work: green
+    r += (1 - covered) * 52; g += (1 - covered) * 168; b += (1 - covered) * 83
+    return (round(Int, r), round(Int, g), round(Int, b))
+end
+
+function _heat(node::_FNode, i, maxv)
+    v = node.n == 0 ? 0.0 : node.vals[i] / node.n
+    f = maxv > 0 ? min(v / maxv, 1.0) : 0.0
+    return (round(Int, 255), round(Int, 235 - 185f), round(Int, 120 - 100f))
+end
+
+"""
+    flamegraph(result, path = "flamegraph.svg"; region = nothing, by = nothing, inlined = false, width = 1400, minwidth = 0.3)
+
+Write an SVG flame graph (root at the bottom, width = sample weight). Colors:
+
+* guided bottleneck mode (default `by = nothing` when remark flags exist): each
+  frame is blended from the share of its samples flagged **blue** = instruction
+  delivery, **red** = discarded (bad speculation), **orange** = instruction
+  processing (back end); unflagged, useful work is **green**.
+* `by = "L1D_CACHE_MISS_LD_NONSPEC"` (or any counter column): heat map of that
+  counter per sample, pale to dark red.
+* otherwise a flat palette.
+
+Hovering a frame shows its weight and per-column values. `minwidth` is the
+smallest frame drawn, in percent of the root.
+"""
+function flamegraph(res::ProfileResult, path::AbstractString = "flamegraph.svg"; region = nothing, by = nothing,
+                    inlined::Bool = false, width::Integer = 1400, minwidth::Real = 0.3)
+    names = res.counter_names; k = length(names)
+    root = _FNode("all", k)
+    maxdepth = 0
+    for s in samples(res, region)
+        frames = inlined ? s.stack : filter(f -> !f.inlined, s.stack)
+        isempty(frames) && continue
+        node = root; node.weight += s.weight; node.n += 1
+        for (i, v) in enumerate(s.values); i <= k && (node.vals[i] += v); end
+        for f in Iterators.reverse(frames)
+            node = get!(node.children, f.func) do; _FNode(f.func, k); end
+            node.weight += s.weight; node.n += 1
+            for (i, v) in enumerate(s.values); i <= k && (node.vals[i] += v); end
+        end
+        maxdepth = max(maxdepth, length(frames))
+    end
+    root.weight == 0 && error("no samples to draw")
+    byi = 0
+    if by !== nothing
+        i = findfirst(==(_mnemonic(by)), names)
+        i === nothing && error("no counter $by in this profile; have $names")
+        byi = i
+    end
+    isflag = byi == 0 && k > 0 && any(n -> haskey(REMARK_COLORS, n), names)
+    maxv = byi == 0 ? 0.0 : maximum(n -> n.n == 0 ? 0.0 : n.vals[byi] / n.n, _allnodes(root); init = 0.0)
+    rowh = 16; pad = 10
+    height = (maxdepth + 1) * rowh + 2pad + 30
+    io = IOBuffer()
+    print(io, """<svg xmlns="http://www.w3.org/2000/svg" width="$width" height="$height" font-family="Menlo, monospace" font-size="11">
+<style>rect:hover{stroke:#000;stroke-width:1}</style>
+<rect width="100%" height="100%" fill="#fafafa"/>
+<text x="$pad" y="18" font-size="13">ApplePerf flame graph — weight: $(res.weight_label)$(byi > 0 ? ", color: $(names[byi]) per sample" : isflag ? ", color: blue=delivery red=discarded (purple=both) orange=processing green=useful" : "")$(region === nothing ? "" : ", region: $region")</text>
+""")
+    scale = (width - 2pad) / root.weight
+    fmtv(v) = res.weight_unit == "ns" ? @sprintf("%.1f ms", v / 1e6) : _commas(round(Int, v))
+    function draw(node::_FNode, x, depth)
+        w = node.weight * scale
+        w < minwidth / 100 * (width - 2pad) && return
+        y = height - pad - 30 - (depth + 1) * rowh
+        col = byi > 0 ? _heat(node, byi, maxv) : isflag ? _blend(node, names) : (205 + (hash(node.name) % 50), 120 + (hash(node.name, UInt(1)) % 80), 60)
+        detail = join(["$(nm): $(isflag ? string(round(Int, 100 * node.vals[i] / max(node.n, 1)), "% of samples") : _commas(round(Int, node.vals[i])))" for (i, nm) in enumerate(names)], "\n")
+        title = replace("$(node.name)\n$(fmtv(node.weight)) ($(round(100 * node.weight / root.weight; digits = 1))%), $(node.n) samples\n$detail", "&" => "&amp;", "<" => "&lt;")
+        label = w > 40 ? replace(first(node.name, max(1, floor(Int, w / 6.5))), "&" => "&amp;", "<" => "&lt;") : ""
+        print(io, """<g><title>$title</title><rect x="$(round(x; digits=1))" y="$y" width="$(round(w; digits=1))" height="$(rowh - 1)" fill="rgb($(col[1]),$(col[2]),$(col[3]))" rx="1"/>""")
+        isempty(label) || print(io, """<text x="$(round(x + 3; digits=1))" y="$(y + 12)" clip-path="inset(0)">$label</text>""")
+        print(io, "</g>\n")
+        cx = x
+        for c in sort(collect(values(node.children)); by = c -> c.weight, rev = true)
+            draw(c, cx, depth + 1); cx += c.weight * scale
+        end
+    end
+    draw(root, pad, 0)
+    print(io, "</svg>\n")
+    write(path, take!(io))
+    return path
+end
+_allnodes(n::_FNode) = (nodes = _FNode[]; _collect!(nodes, n); nodes)
+_collect!(acc, n) = (push!(acc, n); for c in values(n.children); _collect!(acc, c); end)
 
 # --- pprof via PProf.jl's protobuf types ----------------------------------------
 

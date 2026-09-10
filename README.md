@@ -27,6 +27,7 @@ open_in_instruments(res.trace)
 |---|---|---|
 | `KPC.measure(f, events)` | **root** | exact per-thread counter deltas around a call (2 fixed + 8 configurable counters, any of the ~136 events in Apple's kpep database); software multiplexing across repeated runs when events conflict |
 | `profile(f)` (default) | none | 1 ms timer samples with call stacks for every thread, each carrying per-sample deltas of cycles, instructions, L1D load misses and branch mispredictions, joined against `@region` intervals |
+| `profile(f; options = RecordingOptions(bottlenecks = true))` | none | Instruments' guided bottleneck analysis: every sample flagged as instruction-delivery-, discarded- or processing-bound; `Analysis.bottleneck_table` and a colored `Analysis.flamegraph` show which code is bound by what |
 | `profile(f; options = RecordingOptions(sample_event = "L1D_CACHE_MISS_LD_NONSPEC", threshold = 20_000))` | none | one stack sample every N occurrences of an event, so per-function / per-line attribution is in **that event's units** (misses, branch mispredicts, cycles, ...) |
 | `profile(f; options = RecordingOptions(template = "Processor Trace"))` | none, but the Julia binary needs `get-task-allow` (see `make_debuggable_julia`) | exact traced instructions and cycles per region from the M4+/M5 processor trace unit (~1 s window, drops data on branch-dense code) |
 | `profile(f; options = RecordingOptions(events = ["FIXED_CYCLES", "L1D_CACHE_MISS_LD_NONSPEC", ...]))` | none | hand-picked event list (up to 2 fixed + 8 configurable): every 1 ms sample carries the per-sample delta of each event, giving exact per-region totals and per-event attribution to functions and lines, all in one run |
@@ -110,6 +111,8 @@ ApplePerf.Analysis.counters(res, "gather")
 ApplePerf.Analysis.by_function(res; region = "gather")
 ApplePerf.Analysis.by_line(res; region = "gather", by = "L1D_CACHE_MISS_LD_NONSPEC")  # attribute a counter instead of time
 ApplePerf.Analysis.inclusive(res)
+ApplePerf.Analysis.bottleneck_table(res)   # per function: time share and per-column values (events per sample, or % flagged)
+ApplePerf.Analysis.flamegraph(res, "flame.svg"; by = "L1D_CACHE_MISS_LD_NONSPEC")  # SVG, heat by counter; guided mode colors by bottleneck
 ApplePerf.Analysis.samples(res, "gather")   # raw Sample objects with symbolized stacks
 ```
 
@@ -197,7 +200,9 @@ julia --project=. examples/demo.jl          # add --open to also open the trace 
 Profiles a contiguous versus strided matrix sum and a predictable versus
 unpredictable branch with five events at once, prints exact per-region
 counters (IPC, L1D and TLB misses, mispredictions per run), the source lines
-responsible, and writes pprof and folded-stack exports. About 20 seconds.
+responsible, writes pprof and folded-stack exports, then reruns under
+Instruments' bottleneck analysis and writes a flame graph colored by
+bottleneck. About 35 seconds.
 
 ## Files
 

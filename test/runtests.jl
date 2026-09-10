@@ -33,6 +33,7 @@ using ApplePerf, Test
         j = ApplePerf.XCTrace.options_json(RecordingOptions())
         @test occursin("\"sampleByTime\":true", j) && occursin("\"manual\"", j)
         @test occursin("\"guided\"", ApplePerf.XCTrace.options_json(RecordingOptions(events = String[])))
+        @test occursin("\"guided\"", ApplePerf.XCTrace.options_json(RecordingOptions(bottlenecks = true)))
         j = ApplePerf.XCTrace.options_json(RecordingOptions(sample_event = "CORE_ACTIVE_CYCLE", threshold = 1000))
         @test occursin("\"pmiThreshold\":1000", j) && occursin("\"sampleByTime\":false", j)
         @test_throws ArgumentError ApplePerf.XCTrace.options_json(RecordingOptions(sample_event = "FIXED_CYCLES"))
@@ -65,6 +66,8 @@ using ApplePerf, Test
             @test any(p -> occursin("mapreduce", p.first) || occursin("sum", p.first), ApplePerf.Analysis.by_function(res))
             pb = tempname() * ".pb.gz"; ApplePerf.Analysis.pprof(res, pb); @test filesize(pb) > 100
             fo = tempname() * ".folded"; ApplePerf.Analysis.collapsed(res, fo); @test filesize(fo) > 10
+            sv = tempname() * ".svg"; ApplePerf.Analysis.flamegraph(res, sv; by = "FIXED_CYCLES"); @test occursin("<svg", read(sv, String))
+            @test occursin("FIXED_CYCLES", sprint(io -> ApplePerf.Analysis.bottleneck_table(res; io, top = 3)))
             rm(res.trace; recursive = true, force = true)
         else
             @info "skipping xctrace tests"
