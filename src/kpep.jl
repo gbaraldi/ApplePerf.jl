@@ -71,17 +71,23 @@ end
 sym(s::Symbol) = (_load(); dlsym(_kpep[], s))
 kperf_sym(s::Symbol) = (_load(); dlsym(_kperf[], s))
 
-const _db = Ref{Ptr{Cvoid}}(C_NULL)
-"""Handle to the kpep database for the current CPU (created lazily)."""
-function db()
-    if _db[] == C_NULL
-        r = Ref{Ptr{Cvoid}}(C_NULL)
-        rc = ccall(sym(:kpep_db_create), Cint, (Cstring, Ref{Ptr{Cvoid}}), C_NULL, r)
-        rc == 0 || error("kpep_db_create failed with code $rc")
-        _db[] = r[]
+@static if isdefined(Base, :OncePerProcess)
+    _once(f) = Base.OncePerProcess(f)
+else
+    function _once(f)
+        r = Ref{Any}(nothing)
+        return () -> (r[] === nothing && (r[] = f()); r[])
     end
-    return _db[]
 end
+
+const _db = _once() do
+    r = Ref{Ptr{Cvoid}}(C_NULL)
+    rc = ccall(sym(:kpep_db_create), Cint, (Cstring, Ref{Ptr{Cvoid}}), C_NULL, r)
+    rc == 0 || error("kpep_db_create failed with code $rc")
+    r[]
+end
+"""Handle to the kpep database for the current CPU (created once per process)."""
+db() = _db()
 
 """Name of the kpep database for this CPU, e.g. `"as12"`."""
 function db_name()
@@ -93,25 +99,25 @@ end
 const KPC_CLASS_FIXED_MASK = UInt32(1)
 const KPC_CLASS_CONFIGURABLE_MASK = UInt32(2)
 
+const _counter_slots = _once() do
+    f = ccall(kperf_sym(:kpc_get_counter_count), UInt32, (UInt32,), KPC_CLASS_FIXED_MASK)
+    c = ccall(kperf_sym(:kpc_get_counter_count), UInt32, (UInt32,), KPC_CLASS_CONFIGURABLE_MASK)
+    (fixed = Int(f), configurable = Int(c))
+end
 """
     counter_slots() -> (fixed = n, configurable = m)
 
 Number of fixed and configurable hardware counters on this CPU (2 + 8 on M1–M5).
 """
-function counter_slots()
-    f = ccall(kperf_sym(:kpc_get_counter_count), UInt32, (UInt32,), KPC_CLASS_FIXED_MASK)
-    c = ccall(kperf_sym(:kpc_get_counter_count), UInt32, (UInt32,), KPC_CLASS_CONFIGURABLE_MASK)
-    return (fixed = Int(f), configurable = Int(c))
-end
+counter_slots() = _counter_slots()
 
-const _events = Ref{Vector{Event}}()
 """
     events() -> Vector{Event}
 
-All performance events the kpep database defines for this CPU.
+All performance events the kpep database defines for this CPU (read once per process).
 """
-function events()
-    isassigned(_events) && return _events[]
+events() = _events()
+const _events = _once() do
     n = Ref{Csize_t}(0)
     ccall(sym(:kpep_db_events_count), Cint, (Ptr{Cvoid}, Ref{Csize_t}), db(), n)
     buf = Vector{Ptr{KpepEventRaw}}(undef, n[])
@@ -124,8 +130,7 @@ function events()
         fixed = r.is_fixed != 0 || (r.mask != 0 && (r.mask & ~UInt32(3)) == 0)
         push!(evs, Event(_cstr(r.name), _cstr(r.alias), _cstr(r.description), _cstr(r.errata), _cstr(r.fallback), r.mask, r.number, fixed))
     end
-    _events[] = evs
-    return evs
+    evs
 end
 
 """Mnemonics of all events, sorted."""

@@ -16,27 +16,44 @@ using ..KPEP
 # Locating xctrace
 # ---------------------------------------------------------------------------
 
-const _xctrace = Ref{String}("")
-function xctrace_path()
-    isempty(_xctrace[]) || return _xctrace[]
+# Results that cannot change during a process (the selected Xcode is fixed by
+# xcode-select) are computed once, lazily, on first use.
+@static if isdefined(Base, :OncePerProcess)
+    _once(f) = Base.OncePerProcess(f)
+else
+    function _once(f)   # Julia < 1.12: simple lazy, non-thread-safe fallback
+        r = Ref{Any}(nothing)
+        return () -> (r[] === nothing && (r[] = f()); r[])
+    end
+end
+
+const _xctrace_path = _once() do
     p = try
         strip(read(`xcrun --find xctrace`, String))
     catch
         ""
     end
     isempty(p) && error("xctrace not found. Install Xcode (Instruments) and select it with xcode-select.")
-    _xctrace[] = String(p)
-    return _xctrace[]
+    String(p)
 end
+"""Path of the xctrace binary of the selected Xcode (resolved once per process)."""
+xctrace_path() = _xctrace_path()
 xctrace_available() = try; !isempty(xctrace_path()); catch; false; end
 
-function version()
+const _version = _once() do
     m = match(r"xctrace version ([0-9.]+)", read(`$(xctrace_path()) version`, String))
-    return m === nothing ? v"0" : VersionNumber(m[1])
+    m === nothing ? v"0" : VersionNumber(m[1])
 end
+"""xctrace version (queried once per process)."""
+version() = _version()
 
-templates() = [String(strip(l)) for l in split(read(`$(xctrace_path()) list templates`, String), '\n') if !isempty(strip(l)) && !occursin(':', l)]
-instruments() = [String(strip(l)) for l in split(read(`$(xctrace_path()) list instruments`, String), '\n') if !isempty(strip(l)) && !occursin(':', l)]
+_listing(what) = [String(strip(l)) for l in split(read(`$(xctrace_path()) list $what`, String), '\n') if !isempty(strip(l)) && !occursin(':', l)]
+const _templates = _once(() -> _listing("templates"))
+const _instruments = _once(() -> _listing("instruments"))
+"""Available template names (queried once per process)."""
+templates() = _templates()
+"""Available instrument names (queried once per process)."""
+instruments() = _instruments()
 
 # ---------------------------------------------------------------------------
 # Recording options

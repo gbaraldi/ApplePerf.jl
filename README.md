@@ -152,15 +152,25 @@ tells you how much was lost.
 
 ## Caveats and things learned the hard way
 
-* **Guided-mode metric values** (`events = String[]`: Cycles, Instruction
-  Delivery / Discarded / Processing Bottleneck) are Instruments' derived
-  per-thread interval values, not raw event counts, and are not attached to
-  samples. The default manual event list gives raw per-sample counts.
-* **xctrace is slow to start and stop.** Attaching takes about 2.3 s, stopping
-  and saving about 2.5 s, and every `xctrace export` invocation about 2 s
-  regardless of table size. `analyze` therefore makes exactly two invocations
-  (toc, then all tables in one export); a `profile` call costs roughly 8 s on
-  top of the workload.
+* **Guided modes** (`events = String[]`, `mode = "bottlenecks"` etc.) report
+  Instruments' derived interval metrics, not raw counts (their "Cycles" column
+  is not cycles), and attach nothing to samples. What they do deliver is the
+  classification: `RegionSummary.remarks` counts Instruments' remarks per
+  region, and in a check with known workloads a memory-bound gather came out
+  "High Processing Bottleneck" and a mispredicting loop "High Discarded" plus
+  "High Delivery". Use the default manual event list for numbers.
+* **xctrace is slow to start and stop, and nothing in the data is to blame.**
+  `xctrace version` takes 0.12 s, but opening a trace document takes 1.85 s
+  whether the trace is 23 MB or 35 MB, with or without its symbol store: the
+  export loads the whole Instruments stack (every instrument package, GPU,
+  simulator and source-editor frameworks) before reading anything. Attaching
+  takes about 2.3 s and stopping plus saving about 2.5 s for the same reason.
+  `analyze` therefore makes exactly two invocations (toc, then all tables in
+  one export; an XPath union cannot fetch the toc alongside data), and
+  unchanging facts (xctrace path, version, template list, the kpep database)
+  are cached once per process. A `profile` call costs roughly 8 s on top of the
+  workload; to amortize it over many measurements, use `XCTrace.attach` /
+  `XCTrace.stop!` once around a batch of `@region`s.
 * **How manual event lists reach xctrace.** `--recording-options` (Xcode 16)
   takes the same JSON the GUI stores in `.tracetemplate` files. Its
   `allEventsAndFormulas` entries are base64 `NSKeyedArchiver` blobs of

@@ -75,6 +75,7 @@ mutable struct ProfileResult
     pt_points::Vector{Tuple{Int,String,Int,Int}}  # (time, tid, instructions, cycles) from Processor Trace
     pt_gaps::Vector{Tuple{Int,String}}
     julia_pid::Int
+    remarks::Vector{Tuple{Int,String,String}}   # (time, tid, remark) from Instruments' guided modes
 end
 
 # ---------------------------------------------------------------------------
@@ -278,7 +279,7 @@ trace of this very process (as `profile` does).
 function analyze(trace::AbstractString; symbolize_jit::Bool = true, template::AbstractString = "", pid::Integer = getpid())
     ti = XCTrace.info(trace)                       # one xctrace call for the toc
     tables = XCTrace.list_tables(ti)
-    wanted = filter(in(tables), ["os-signpost", "counters-profile", "time-profile", "CounterMetricByThread", "processor-trace-points", "processor-trace-gaps"])
+    wanted = filter(in(tables), ["os-signpost", "counters-profile", "time-profile", "CounterMetricByThread", "CountingModeSamples", "processor-trace-points", "processor-trace-gaps"])
     "counters-profile" in wanted && filter!(!=("time-profile"), wanted)   # counters-profile supersedes it
     tabs = XCTrace.export_tables(ti, wanted)       # one xctrace call for every table we need
     regions = haskey(tabs, "os-signpost") ? _regions(tabs["os-signpost"]) : Region[]
@@ -307,7 +308,16 @@ function analyze(trace::AbstractString; symbolize_jit::Bool = true, template::Ab
         counter_names = counter_names[1:n]
     end
     pts, gaps = _pt(tabs)
-    return ProfileResult(String(trace), String(template), unit, label, regions, samples, counter_names, crows, pts, gaps, pid)
+    remarks = Tuple{Int,String,String}[]
+    if haskey(tabs, "CountingModeSamples") && !isempty(tabs["CountingModeSamples"].rows)
+        t = tabs["CountingModeSamples"]
+        it = colindex(t, "Timestamp"); ith = colindex(t, "Thread"); ir = colindex(t, "Remark")
+        for r in t.rows
+            r[ir].tag == "sentinel" && continue
+            push!(remarks, (rawint(r[it]), _tid(r[ith]), fmt(r[ir])))
+        end
+    end
+    return ProfileResult(String(trace), String(template), unit, label, regions, samples, counter_names, crows, pts, gaps, pid, remarks)
 end
 
 # ---------------------------------------------------------------------------
@@ -341,6 +351,7 @@ struct RegionSummary
     pt_instructions::Int
     pt_cycles::Int
     pt_gaps::Int
+    remarks::Dict{String,Int}     # Instruments' bottleneck remarks (guided modes), sample counts
 end
 
 """
@@ -378,7 +389,11 @@ function regions(res::ProfileResult)
         for (t, tid) in res.pt_gaps, r in regs
             (tid == r.tid && r.start <= t <= r.stop) && (gaps += 1)
         end
-        push!(out, RegionSummary(nm, length(regs), sum(duration, regs), ns, w, cnt, ins, cyc, gaps))
+        rem = Dict{String,Int}()
+        for (t, tid, name) in res.remarks, r in regs
+            (tid == r.tid && r.start <= t <= r.stop) && (rem[name] = get(rem, name, 0) + 1)
+        end
+        push!(out, RegionSummary(nm, length(regs), sum(duration, regs), ns, w, cnt, ins, cyc, gaps, rem))
     end
     return out
 end
@@ -487,6 +502,7 @@ function Base.show(io::IO, ::MIME"text/plain", res::ProfileResult)
     println(io, "ApplePerf.ProfileResult  (", res.template, ")  trace: ", res.trace)
     println(io, "  ", length(res.samples), " samples weighted by ", res.weight_label, ", ", length(res.regions), " region intervals, ",
             length(res.counter_rows), " counter rows", isempty(res.pt_points) ? "" : ", $(length(res.pt_points)) processor-trace points")
+    isempty(res.counter_rows) || println(io, "  guided-mode metrics below are Instruments' derived interval values, not raw counts; see the remarks lines")
     regs = regions(res)
     if !isempty(regs)
         println(io)
@@ -501,6 +517,10 @@ function Base.show(io::IO, ::MIME"text/plain", res::ProfileResult)
             end
             if r.pt_cycles > 0
                 @printf(io, "      processor trace: %s instructions, %s cycles, IPC %.2f, %d gaps\n", _commas(r.pt_instructions), _commas(r.pt_cycles), r.pt_instructions / r.pt_cycles, r.pt_gaps)
+            end
+            if !isempty(r.remarks)
+                tot = sum(values(r.remarks))
+                println(io, "      remarks: ", join(["$k $(round(Int, 100v / tot))%" for (k, v) in sort(collect(r.remarks); by = last, rev = true)], ", "))
             end
         end
     end
