@@ -158,7 +158,10 @@ tells you how much was lost.
   classification: `RegionSummary.remarks` counts Instruments' remarks per
   region, and in a check with known workloads a memory-bound gather came out
   "High Processing Bottleneck" and a mispredicting loop "High Discarded" plus
-  "High Delivery". Use the default manual event list for numbers.
+  "High Delivery" on every sample. Instruments shows the same data as a stacked
+  Cycles graph (Delivery / Discarded / Processing / Useful) with a remarks
+  track whose entries carry a synopsis and a "suggested next mode" to drill
+  into. Use the default manual event list for numbers.
 * **xctrace is slow to start and stop, and nothing in the data is to blame.**
   `xctrace version` takes 0.12 s, but opening a trace document takes 1.85 s
   whether the trace is 23 MB or 35 MB, with or without its symbol store: the

@@ -351,7 +351,7 @@ struct RegionSummary
     pt_instructions::Int
     pt_cycles::Int
     pt_gaps::Int
-    remarks::Dict{String,Int}     # Instruments' bottleneck remarks (guided modes), sample counts
+    remarks::Dict{String,Int}     # Instruments' bottleneck remarks (guided modes): number of 1 ms samples flagged with each
 end
 
 """
@@ -519,8 +519,9 @@ function Base.show(io::IO, ::MIME"text/plain", res::ProfileResult)
                 @printf(io, "      processor trace: %s instructions, %s cycles, IPC %.2f, %d gaps\n", _commas(r.pt_instructions), _commas(r.pt_cycles), r.pt_instructions / r.pt_cycles, r.pt_gaps)
             end
             if !isempty(r.remarks)
-                tot = sum(values(r.remarks))
-                println(io, "      remarks: ", join(["$k $(round(Int, 100v / tot))%" for (k, v) in sort(collect(r.remarks); by = last, rev = true)], ", "))
+                # a 1 ms sample can carry several remarks, so report each as a fraction of the region's samples
+                println(io, "      remarks (share of samples flagged): ",
+                        join(["$k $(round(Int, 100v / max(r.nsamples, 1)))%" for (k, v) in sort(collect(r.remarks); by = last, rev = true)], ", "))
             end
         end
     end
